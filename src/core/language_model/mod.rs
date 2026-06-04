@@ -407,6 +407,19 @@ impl LanguageModelOptions {
         }
     }
 
+    /// Returns the reasoning content of the last assistant message, if any.
+    pub fn reasoning_content(&self) -> Option<String> {
+        self.messages.iter().rev().find_map(|tm| match &tm.message {
+            Message::Assistant(am) => match &am.content {
+                LanguageModelResponseContentType::Reasoning { content, .. } => {
+                    Some(content.clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+    }
+
     /// Extracts all tool results from the conversation.
     pub fn tool_results(&self) -> Option<Vec<ToolResultInfo>> {
         self.messages.as_slice().extract_tool_results()
@@ -438,6 +451,20 @@ pub enum LanguageModelResponseContentType {
     Reasoning {
         /// The reasoning/thinking content
         content: String,
+        /// Provider-specific extensions
+        extensions: crate::extensions::Extensions,
+    },
+    /// A complete assistant turn from a thinking model: reasoning content,
+    /// text response, and tool calls all in one message. The ChatMessage
+    /// conversion merges these into one well-formed API message without
+    /// splitting and re-merging.
+    ReasonedResponse {
+        /// The reasoning/thinking content
+        reasoning: String,
+        /// The text response (may be empty when tool calls are present)
+        text: String,
+        /// Tool calls from this turn (may be empty)
+        tool_calls: Vec<ToolCallInfo>,
         /// Provider-specific extensions
         extensions: crate::extensions::Extensions,
     },

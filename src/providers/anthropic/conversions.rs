@@ -81,6 +81,7 @@ impl From<LanguageModelOptions> for AnthropicOptions {
                         });
                     }
                     LanguageModelResponseContentType::NotSupported(_) => {}
+                    _ => {}
                 },
                 Message::Tool(tool) => {
                     messages.push(AnthropicMessageParam::User {
