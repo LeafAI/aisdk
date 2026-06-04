@@ -34,6 +34,16 @@ impl<M: ModelName> LanguageModel for OpenAIChatCompletions<M> {
         let mut contents = Vec::new();
 
         for choice in response.choices {
+            // Handle reasoning content (for reasoning models like o1, DeepSeek R1)
+            if let Some(reasoning) = choice.message.reasoning_content
+                && !reasoning.is_empty()
+            {
+                contents.push(LanguageModelResponseContentType::Reasoning {
+                    content: reasoning,
+                    extensions: crate::extensions::Extensions::default(),
+                });
+            }
+
             // Handle text content
             if let Some(text) = choice.message.content
                 && !text.is_empty()

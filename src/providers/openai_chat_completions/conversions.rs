@@ -24,6 +24,7 @@ impl From<LanguageModelOptions> for client::ChatCompletionsOptions {
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             });
         }
 
@@ -136,6 +137,7 @@ impl From<Message> for types::ChatMessage {
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message::User(u) => types::ChatMessage {
                 role: types::Role::User,
@@ -143,6 +145,7 @@ impl From<Message> for types::ChatMessage {
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message::Assistant(a) => match a.content {
                 LanguageModelResponseContentType::Text(text) => types::ChatMessage {
@@ -151,6 +154,7 @@ impl From<Message> for types::ChatMessage {
                     name: None,
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
                 LanguageModelResponseContentType::ToolCall(tool_info) => types::ChatMessage {
                     role: types::Role::Assistant,
@@ -165,16 +169,46 @@ impl From<Message> for types::ChatMessage {
                         },
                     }]),
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
-                LanguageModelResponseContentType::Reasoning { content, .. } => {
-                    // Chat Completions doesn't have separate reasoning messages
-                    // Include as text with prefix
+                LanguageModelResponseContentType::Reasoning { content, .. } => types::ChatMessage {
+                    role: types::Role::Assistant,
+                    content: Some(String::new()),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: Some(content),
+                },
+                LanguageModelResponseContentType::ReasonedResponse {
+                    reasoning,
+                    text,
+                    tool_calls,
+                    ..
+                } => {
+                    let tc_list = if tool_calls.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            tool_calls
+                                .into_iter()
+                                .map(|tc| types::ToolCall {
+                                    id: tc.tool.id,
+                                    type_: "function".to_string(),
+                                    function: types::FunctionCall {
+                                        name: tc.tool.name,
+                                        arguments: tc.input.to_string(),
+                                    },
+                                })
+                                .collect(),
+                        )
+                    };
                     types::ChatMessage {
                         role: types::Role::Assistant,
-                        content: Some(format!("[Reasoning]: {content}")),
+                        content: Some(text),
                         name: None,
-                        tool_calls: None,
+                        tool_calls: tc_list,
                         tool_call_id: None,
+                        reasoning_content: Some(reasoning),
                     }
                 }
                 _ => types::ChatMessage {
@@ -183,6 +217,7 @@ impl From<Message> for types::ChatMessage {
                     name: None,
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
             },
             Message::Tool(tool_result) => types::ChatMessage {
@@ -196,6 +231,7 @@ impl From<Message> for types::ChatMessage {
                 name: Some(tool_result.tool.name),
                 tool_calls: None,
                 tool_call_id: Some(tool_result.tool.id),
+                reasoning_content: None,
             },
             Message::Developer(d) => types::ChatMessage {
                 role: types::Role::Developer,
@@ -203,6 +239,7 @@ impl From<Message> for types::ChatMessage {
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
         }
     }
@@ -268,7 +305,7 @@ impl From<types::Usage> for Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::tools::{Tool, ToolExecute, ToolList};
+    use crate::core::tools::{Tool, ToolExecute, ToolList, ToolResultInfo};
     use schemars::{JsonSchema, schema_for};
     use serde::{Deserialize, Serialize};
     use serde_json::json;
@@ -441,6 +478,204 @@ mod tests {
             Some(types::ToolChoice::String(choice)) if choice == "auto"
         ));
         assert_eq!(completions_opts.parallel_tool_calls, Some(true));
+    }
+
+    /// ReasonedResponse variant: one SDK message → one ChatMessage with
+    /// reasoning_content + text + tool_calls all in one message.
+    #[test]
+    fn test_reasoned_response_conversion() {
+        let msg = Message::Assistant(crate::core::messages::AssistantMessage {
+            content: LanguageModelResponseContentType::ReasonedResponse {
+                reasoning: "I need two tools".to_string(),
+                text: String::new(),
+                tool_calls: vec![
+                    {
+                        let mut tc = crate::core::tools::ToolCallInfo::new("read_file");
+                        tc.id("call_1".to_string());
+                        tc.input(serde_json::json!({"path": "a.rs"}));
+                        tc
+                    },
+                    {
+                        let mut tc = crate::core::tools::ToolCallInfo::new("search");
+                        tc.id("call_2".to_string());
+                        tc.input(serde_json::json!({"pattern": "fn main"}));
+                        tc
+                    },
+                ],
+                extensions: crate::extensions::Extensions::default(),
+            },
+            usage: None,
+        });
+
+        let chat_msg: types::ChatMessage = msg.into();
+        assert_eq!(chat_msg.role, types::Role::Assistant);
+        assert_eq!(
+            chat_msg.reasoning_content.as_deref(),
+            Some("I need two tools")
+        );
+        let calls = chat_msg
+            .tool_calls
+            .as_ref()
+            .expect("tool_calls must be present");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[1].function.name, "search");
+    }
+
+    /// ReasonedResponse without tool calls: reasoning + text only.
+    #[test]
+    fn test_reasoned_response_no_tool_calls() {
+        let msg = Message::Assistant(crate::core::messages::AssistantMessage {
+            content: LanguageModelResponseContentType::ReasonedResponse {
+                reasoning: "Let me think...".to_string(),
+                text: "The answer is 42".to_string(),
+                tool_calls: vec![],
+                extensions: crate::extensions::Extensions::default(),
+            },
+            usage: None,
+        });
+
+        let chat_msg: types::ChatMessage = msg.into();
+        assert_eq!(chat_msg.role, types::Role::Assistant);
+        assert_eq!(
+            chat_msg.reasoning_content.as_deref(),
+            Some("Let me think...")
+        );
+        assert_eq!(chat_msg.content.as_deref(), Some("The answer is 42"));
+        assert!(chat_msg.tool_calls.is_none());
+    }
+
+    /// ReasonedResponse with 3 tool calls serialized: all tool_calls must be present
+    /// in valid JSON — regression test for truncation in large multi-message requests.
+    #[test]
+    fn test_reasoned_response_serialization_with_many_messages() {
+        let mut messages = Vec::new();
+        messages.push(Message::System("You are a helpful assistant".to_string().into()).into());
+
+        // Simulate 6 agent-tool round-trips (12 messages total)
+        for i in 0..6 {
+            messages.push(Message::User(format!("Request {}", i).into()).into());
+
+            let mut tc1 = crate::core::tools::ToolCallInfo::new("file_read");
+            tc1.id(format!("call_{i}_0"));
+            tc1.input(serde_json::json!({"path": format!("/tmp/file{}.txt", i), "start_line": 1, "end_line": 50}));
+            let mut tc2 = crate::core::tools::ToolCallInfo::new("file_glob");
+            tc2.id(format!("call_{i}_1"));
+            tc2.input(serde_json::json!({"pattern": format!("**/*.{}.kt", i), "working_dir": "/Users/test"}));
+            let mut tc3 = crate::core::tools::ToolCallInfo::new("search");
+            tc3.id(format!("call_{i}_2"));
+            tc3.input(serde_json::json!({"query": format!("test query {}", i)}));
+
+            messages.push(
+                Message::Assistant(crate::core::messages::AssistantMessage {
+                    content: LanguageModelResponseContentType::ReasonedResponse {
+                        reasoning: format!("Thinking about request {}...", i),
+                        text: String::new(),
+                        tool_calls: vec![tc1, tc2, tc3],
+                        extensions: crate::extensions::Extensions::default(),
+                    },
+                    usage: None,
+                })
+                .into(),
+            );
+
+            messages.push(
+                Message::Tool(ToolResultInfo {
+                    tool: crate::core::tools::ToolDetails {
+                        name: "file_read".to_string(),
+                        id: format!("call_{i}_0"),
+                    },
+                    output: Ok(serde_json::json!({"content": format!("content of file {}", i)})),
+                })
+                .into(),
+            );
+            messages.push(
+                Message::Tool(ToolResultInfo {
+                    tool: crate::core::tools::ToolDetails {
+                        name: "file_glob".to_string(),
+                        id: format!("call_{i}_1"),
+                    },
+                    output: Ok(serde_json::json!({"matches": [format!("file{}.kt", i)]})),
+                })
+                .into(),
+            );
+            messages.push(
+                Message::Tool(ToolResultInfo {
+                    tool: crate::core::tools::ToolDetails {
+                        name: "search".to_string(),
+                        id: format!("call_{i}_2"),
+                    },
+                    output: Ok(serde_json::json!({"results": []})),
+                })
+                .into(),
+            );
+        }
+
+        let options = LanguageModelOptions {
+            messages,
+            ..Default::default()
+        };
+
+        let completions_opts: client::ChatCompletionsOptions = options.into();
+        let json_str =
+            serde_json::to_string_pretty(&completions_opts).expect("serialization must succeed");
+
+        // Must be valid JSON
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json_str).expect("output must be valid JSON");
+
+        let msgs = parsed["messages"]
+            .as_array()
+            .expect("messages must be array");
+        // 1 system + 6*(1 user + 1 assistant + 3 tool) = 1 + 6*5 = 31
+        assert_eq!(msgs.len(), 31, "expected 31 messages, got {}", msgs.len());
+
+        // Every assistant message with reasoning should have exactly 3 tool_calls
+        let mut assistant_count = 0;
+        for msg in msgs {
+            if msg["role"] == "assistant" && msg["reasoning_content"].is_string() {
+                assistant_count += 1;
+                let tcs = msg["tool_calls"]
+                    .as_array()
+                    .expect("tool_calls must be present and an array");
+                assert_eq!(
+                    tcs.len(),
+                    3,
+                    "assistant message {} should have 3 tool_calls",
+                    assistant_count
+                );
+                for tc in tcs {
+                    assert!(tc["id"].is_string(), "each tool_call must have id");
+                    assert_eq!(
+                        tc["type"], "function",
+                        "each tool_call must have type=function"
+                    );
+                    assert!(
+                        tc["function"]["name"].is_string(),
+                        "tool_call must have function name"
+                    );
+                    assert!(
+                        tc["function"]["arguments"].is_string(),
+                        "tool_call must have function arguments"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            assistant_count, 6,
+            "expected 6 assistant messages with reasoning"
+        );
+
+        // Verify the last assistant message's tool_calls are complete
+        let last_assistant = msgs
+            .iter()
+            .rev()
+            .find(|m| m["role"] == "assistant" && m["reasoning_content"].is_string())
+            .expect("must have assistant message");
+        let last_tcs = last_assistant["tool_calls"].as_array().unwrap();
+        assert_eq!(last_tcs.len(), 3);
+        assert_eq!(last_tcs[2]["function"]["name"], "search");
+        assert_eq!(last_tcs[2]["id"], "call_5_2");
     }
 
     #[test]
