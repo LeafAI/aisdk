@@ -92,6 +92,14 @@ impl<M: ModelName> LanguageModel for OpenAIChatCompletions<M> {
         // Track open text / reasoning blocks so we can emit the matching End events
         let mut text_open = false;
         let mut reasoning_open = false;
+        // Some providers (OpenAI with `stream_options.include_usage`, agnes, ...)
+        // report token usage in a trailing chunk whose choices carry no
+        // `finish_reason`. The stream consumer stops reading once a
+        // text-completion `Done` is emitted, so that trailing chunk would never
+        // be read and its usage silently dropped. Defer the text-completion
+        // `Done` until usage arrives (trailing chunk), the stream signals
+        // `[DONE]`, or the connection closes — whichever comes first.
+        let mut pending_text_done = false;
 
         // Map stream events to SDK stream chunks
         let stream = stream.map(move |evt_res| match evt_res {
@@ -212,10 +220,23 @@ impl<M: ModelName> LanguageModel for OpenAIChatCompletions<M> {
                                         LanguageModelStreamChunkType::TextEnd,
                                     ));
                                 }
-                                results.push(LanguageModelStreamChunk::Done(AssistantMessage {
-                                    content: LanguageModelResponseContentType::Text(String::new()),
-                                    usage,
-                                }));
+                                // Emit `Done` now only when usage is already
+                                // present in this chunk; otherwise defer until a
+                                // trailing usage chunk (or stream end) so the
+                                // token usage isn't dropped.
+                                match usage {
+                                    Some(u) => {
+                                        results.push(LanguageModelStreamChunk::Done(
+                                            AssistantMessage {
+                                                content: LanguageModelResponseContentType::Text(
+                                                    String::new(),
+                                                ),
+                                                usage: Some(u),
+                                            },
+                                        ));
+                                    }
+                                    None => pending_text_done = true,
+                                }
                             }
                             "length" => {
                                 if reasoning_open {
@@ -235,10 +256,19 @@ impl<M: ModelName> LanguageModel for OpenAIChatCompletions<M> {
                                         "max_tokens".to_string(),
                                     ),
                                 ));
-                                results.push(LanguageModelStreamChunk::Done(AssistantMessage {
-                                    content: LanguageModelResponseContentType::Text(String::new()),
-                                    usage,
-                                }));
+                                match usage {
+                                    Some(u) => {
+                                        results.push(LanguageModelStreamChunk::Done(
+                                            AssistantMessage {
+                                                content: LanguageModelResponseContentType::Text(
+                                                    String::new(),
+                                                ),
+                                                usage: Some(u),
+                                            },
+                                        ));
+                                    }
+                                    None => pending_text_done = true,
+                                }
                             }
                             "tool_calls" | "function_call" => {
                                 // Send accumulated tool calls
@@ -296,16 +326,55 @@ impl<M: ModelName> LanguageModel for OpenAIChatCompletions<M> {
                     }
                 }
 
+                // Trailing usage chunk: the provider reported `finish_reason` in
+                // an earlier chunk (deferred above) and carries token usage here,
+                // in a chunk whose choices have no `finish_reason`. Flush the
+                // deferred `Done` now so the usage is recorded.
+                if pending_text_done && let Some(u) = chunk.usage.clone() {
+                    pending_text_done = false;
+                    results.push(LanguageModelStreamChunk::Done(AssistantMessage {
+                        content: LanguageModelResponseContentType::Text(String::new()),
+                        usage: Some(u.into()),
+                    }));
+                }
+
                 Ok(results)
             }
             Ok(types::ChatCompletionsStreamEvent::Open) => Ok(vec![]),
-            Ok(types::ChatCompletionsStreamEvent::Done) => Ok(vec![]),
+            Ok(types::ChatCompletionsStreamEvent::Done) => {
+                // Stream signalled `[DONE]`. If a text-completion `Done` was
+                // deferred and no trailing usage chunk ever arrived, flush it now
+                // (without usage) so the assistant message is still recorded.
+                if pending_text_done {
+                    pending_text_done = false;
+                    Ok(vec![LanguageModelStreamChunk::Done(AssistantMessage {
+                        content: LanguageModelResponseContentType::Text(String::new()),
+                        usage: None,
+                    })])
+                } else {
+                    Ok(vec![])
+                }
+            }
             Ok(types::ChatCompletionsStreamEvent::Error(e)) => {
                 Ok(vec![LanguageModelStreamChunk::Delta(
                     LanguageModelStreamChunkType::Failed(e),
                 )])
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                // A finished response whose stream closes without an explicit
+                // `[DONE]` surfaces here as a stream-end error. If we deferred a
+                // text-completion `Done`, treat this as normal termination and
+                // flush it rather than failing the turn.
+                if pending_text_done {
+                    pending_text_done = false;
+                    Ok(vec![LanguageModelStreamChunk::Done(AssistantMessage {
+                        content: LanguageModelResponseContentType::Text(String::new()),
+                        usage: None,
+                    })])
+                } else {
+                    Err(e)
+                }
+            }
         });
 
         Ok(Box::pin(stream))
@@ -815,5 +884,129 @@ mod tests {
         assert!(request.contains("\"stream\":true"));
         assert!(request.contains("\"temperature\":0.6"));
         assert!(request.contains("\"top_p\":0.95"));
+    }
+
+    // Emulates providers (OpenAI with `stream_options.include_usage`, agnes)
+    // that report token usage in a trailing chunk: the `stop` chunk carries no
+    // usage, and a later choice-less chunk holds the usage before `[DONE]`.
+    async fn spawn_sse_server_trailing_usage() -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have address");
+
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("server should accept");
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 1024];
+
+            loop {
+                let read = socket
+                    .read(&mut chunk)
+                    .await
+                    .expect("request should be readable");
+                if read == 0 {
+                    break;
+                }
+
+                buffer.extend_from_slice(&chunk[..read]);
+
+                if let Some(headers_end) =
+                    buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let headers_end = headers_end + 4;
+                    let request = String::from_utf8_lossy(&buffer).to_string();
+                    let body_length = content_length(&request);
+                    if buffer.len() >= headers_end + body_length {
+                        break;
+                    }
+                }
+            }
+
+            let request = String::from_utf8(buffer).expect("request should be valid utf-8");
+            let response_body = concat!(
+                "data: {",
+                "\"id\":\"chatcmpl-1\",",
+                "\"object\":\"chat.completion.chunk\",",
+                "\"created\":0,",
+                "\"model\":\"gpt-4o-mini\",",
+                "\"choices\":[{",
+                "\"index\":0,",
+                "\"delta\":{\"content\":\"Hello\"},",
+                "\"finish_reason\":null",
+                "}]",
+                "}\n\n",
+                "data: {",
+                "\"id\":\"chatcmpl-1\",",
+                "\"object\":\"chat.completion.chunk\",",
+                "\"created\":0,",
+                "\"model\":\"gpt-4o-mini\",",
+                "\"choices\":[{",
+                "\"index\":0,",
+                "\"delta\":{},",
+                "\"finish_reason\":\"stop\"",
+                "}]",
+                "}\n\n",
+                "data: {",
+                "\"id\":\"chatcmpl-1\",",
+                "\"object\":\"chat.completion.chunk\",",
+                "\"created\":0,",
+                "\"model\":\"gpt-4o-mini\",",
+                "\"choices\":[],",
+                "\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7,\"total_tokens\":18}",
+                "}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("response should be writable");
+
+            request
+        });
+
+        (format!("http://{}", address), handle)
+    }
+
+    #[tokio::test]
+    async fn test_stream_text_captures_trailing_usage_chunk() {
+        let (base_url, request_handle) = spawn_sse_server_trailing_usage().await;
+
+        let mut model = test_model(base_url);
+        let mut stream = model
+            .stream_text(LanguageModelOptions {
+                messages: vec![Message::User("Hello".to_string().into()).into()],
+                ..Default::default()
+            })
+            .await
+            .expect("stream request should succeed");
+
+        let mut chunks = Vec::new();
+        while let Ok(Some(item)) = tokio::time::timeout(Duration::from_secs(1), stream.next()).await
+        {
+            chunks.extend(item.expect("stream event should parse"));
+        }
+
+        let _ = request_handle
+            .await
+            .expect("request capture should succeed");
+
+        let usage = chunks
+            .iter()
+            .find_map(|chunk| match chunk {
+                LanguageModelStreamChunk::Done(message) => Some(message.usage.clone()),
+                _ => None,
+            })
+            .expect("stream should emit a Done chunk")
+            .expect("Done chunk should carry usage from the trailing chunk");
+
+        assert_eq!(usage.input_tokens, Some(11));
+        assert_eq!(usage.output_tokens, Some(7));
     }
 }
