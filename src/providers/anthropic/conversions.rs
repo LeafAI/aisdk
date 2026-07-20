@@ -166,6 +166,7 @@ impl From<AnthropicUsage> for Usage {
             output_tokens: Some(usage.output_tokens),
             cached_tokens: Some(usage.cache_creation_input_tokens + usage.cache_read_input_tokens),
             reasoning_tokens: None,
+            cache_miss_tokens: None,
         }
     }
 }
@@ -180,6 +181,7 @@ impl From<AnthropicMessageDeltaUsage> for Usage {
                     + usage.cache_read_input_tokens.unwrap_or(0),
             ),
             reasoning_tokens: None,
+            cache_miss_tokens: None,
         }
     }
 }
