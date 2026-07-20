@@ -300,6 +300,7 @@ impl From<types::Usage> for Usage {
             cached_tokens: usage
                 .prompt_tokens_details
                 .map(|d| d.cached_tokens as usize),
+            cache_miss_tokens: usage.prompt_cache_miss_tokens.map(|v| v as usize),
         }
     }
 }
@@ -686,6 +687,7 @@ mod tests {
             prompt_tokens: 100,
             completion_tokens: 50,
             total_tokens: 150,
+            prompt_cache_miss_tokens: Some(30),
             prompt_tokens_details: Some(types::PromptTokensDetails {
                 cached_tokens: 20,
                 audio_tokens: None,
@@ -703,5 +705,6 @@ mod tests {
         assert_eq!(sdk_usage.output_tokens, Some(50));
         assert_eq!(sdk_usage.cached_tokens, Some(20));
         assert_eq!(sdk_usage.reasoning_tokens, Some(10));
+        assert_eq!(sdk_usage.cache_miss_tokens, Some(30));
     }
 }

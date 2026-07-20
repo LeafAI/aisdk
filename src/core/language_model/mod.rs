@@ -502,6 +502,8 @@ pub struct Usage {
     pub reasoning_tokens: Option<usize>,
     /// Number of cached tokens reused.
     pub cached_tokens: Option<usize>,
+    /// Number of tokens that were cache misses.
+    pub cache_miss_tokens: Option<usize>,
 }
 
 impl Add for &Usage {
@@ -513,6 +515,7 @@ impl Add for &Usage {
             output_tokens: utils::sum_options(self.output_tokens, rhs.output_tokens),
             reasoning_tokens: utils::sum_options(self.reasoning_tokens, rhs.reasoning_tokens),
             cached_tokens: utils::sum_options(self.cached_tokens, rhs.cached_tokens),
+            cache_miss_tokens: utils::sum_options(self.cache_miss_tokens, rhs.cache_miss_tokens),
         }
     }
 }
@@ -672,12 +675,14 @@ mod tests {
             output_tokens: Some(20),
             reasoning_tokens: Some(5),
             cached_tokens: Some(2),
+            cache_miss_tokens: None,
         };
         let u2 = Usage {
             input_tokens: Some(15),
             output_tokens: Some(25),
             reasoning_tokens: Some(10),
             cached_tokens: Some(3),
+            cache_miss_tokens: None,
         };
         let result = &u1 + &u2;
         assert_eq!(result.input_tokens, Some(25));
@@ -693,12 +698,14 @@ mod tests {
             output_tokens: Some(20),
             reasoning_tokens: Some(5),
             cached_tokens: Some(2),
+            cache_miss_tokens: None,
         };
         let u2 = Usage {
             input_tokens: None,
             output_tokens: None,
             reasoning_tokens: None,
             cached_tokens: None,
+            cache_miss_tokens: None,
         };
         let result = &u1 + &u2;
         assert_eq!(result.input_tokens, Some(10));
@@ -714,12 +721,14 @@ mod tests {
             output_tokens: None,
             reasoning_tokens: None,
             cached_tokens: None,
+            cache_miss_tokens: None,
         };
         let u2 = Usage {
             input_tokens: Some(15),
             output_tokens: Some(25),
             reasoning_tokens: Some(10),
             cached_tokens: Some(3),
+            cache_miss_tokens: None,
         };
         let result = &u1 + &u2;
         assert_eq!(result.input_tokens, Some(15));
@@ -746,12 +755,14 @@ mod tests {
             output_tokens: None,
             reasoning_tokens: None,
             cached_tokens: Some(2),
+            cache_miss_tokens: None,
         };
         let u2 = Usage {
             input_tokens: None,
             output_tokens: Some(25),
             reasoning_tokens: Some(10),
             cached_tokens: None,
+            cache_miss_tokens: None,
         };
         let result = &u1 + &u2;
         assert_eq!(result.input_tokens, Some(10));
@@ -767,12 +778,14 @@ mod tests {
             output_tokens: Some(0),
             reasoning_tokens: Some(0),
             cached_tokens: Some(0),
+            cache_miss_tokens: None,
         };
         let u2 = Usage {
             input_tokens: Some(0),
             output_tokens: Some(0),
             reasoning_tokens: Some(0),
             cached_tokens: Some(0),
+            cache_miss_tokens: None,
         };
         let result = &u1 + &u2;
         assert_eq!(result.input_tokens, Some(0));
@@ -791,6 +804,7 @@ mod tests {
                     output_tokens: Some(5),
                     reasoning_tokens: Some(2),
                     cached_tokens: Some(1),
+                    cache_miss_tokens: None,
                 }),
             }),
             Message::User("Hi".to_string().into()),
@@ -801,6 +815,7 @@ mod tests {
                     output_tokens: Some(3),
                     reasoning_tokens: Some(1),
                     cached_tokens: Some(0),
+                    cache_miss_tokens: None,
                 }),
             }),
         ];
