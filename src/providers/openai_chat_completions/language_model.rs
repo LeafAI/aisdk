@@ -562,6 +562,126 @@ mod tests {
         (format!("http://{}", address), handle)
     }
 
+    /// Reserves a `127.0.0.1` port and immediately releases it (so an
+    /// early connection attempt against it is refused), then spawns a task
+    /// that waits `delay` before binding a one-shot SSE server on that exact
+    /// port. Used to exercise `send_and_stream`'s connect-retry: the first
+    /// attempt hits "connection refused" (a retryable transport error) and
+    /// the retry succeeds once the delayed listener comes up.
+    async fn spawn_delayed_sse_server(delay: Duration) -> String {
+        let reserved = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = reserved.local_addr().expect("listener should have address");
+        drop(reserved); // free the port so the first connect attempt is refused
+
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let listener = TcpListener::bind(address)
+                .await
+                .expect("delayed listener should rebind the same port");
+            let (mut socket, _) = listener.accept().await.expect("server should accept");
+
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let read = socket
+                    .read(&mut chunk)
+                    .await
+                    .expect("request should be readable");
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+                if let Some(headers_end) =
+                    buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let headers_end = headers_end + 4;
+                    let request = String::from_utf8_lossy(&buffer).to_string();
+                    let body_length = content_length(&request);
+                    if buffer.len() >= headers_end + body_length {
+                        break;
+                    }
+                }
+            }
+
+            let response_body = concat!(
+                "data: {",
+                "\"id\":\"chatcmpl-1\",",
+                "\"object\":\"chat.completion.chunk\",",
+                "\"created\":0,",
+                "\"model\":\"gpt-4o-mini\",",
+                "\"choices\":[{",
+                "\"index\":0,",
+                "\"delta\":{\"content\":\"Hello\"},",
+                "\"finish_reason\":null",
+                "}]",
+                "}\n\n",
+                "data: {",
+                "\"id\":\"chatcmpl-1\",",
+                "\"object\":\"chat.completion.chunk\",",
+                "\"created\":0,",
+                "\"model\":\"gpt-4o-mini\",",
+                "\"choices\":[{",
+                "\"index\":0,",
+                "\"delta\":{},",
+                "\"finish_reason\":\"stop\"",
+                "}]",
+                "}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("response should be writable");
+        });
+
+        format!("http://{}", address)
+    }
+
+    #[tokio::test]
+    async fn test_stream_text_retries_connection_refused_and_succeeds() {
+        // Nothing is listening on the reserved port for the first ~200ms, so
+        // the initial connection attempt fails with a retryable transport
+        // error ("connection refused"). `send_and_stream`'s connect-retry
+        // (500ms initial backoff) should transparently retry once the
+        // delayed server comes up, and the stream should still yield the
+        // full response with no visible error to the caller.
+        let base_url = spawn_delayed_sse_server(Duration::from_millis(200)).await;
+
+        let mut model = test_model(base_url);
+        let mut stream = model
+            .stream_text(LanguageModelOptions {
+                messages: vec![Message::User("Hello".to_string().into()).into()],
+                ..Default::default()
+            })
+            .await
+            .expect("stream should eventually connect after the transient failure");
+
+        let mut chunks = Vec::new();
+        while let Ok(Some(item)) = tokio::time::timeout(Duration::from_secs(2), stream.next()).await
+        {
+            chunks.extend(item.expect("stream event should parse"));
+        }
+
+        let text: String = chunks
+            .iter()
+            .filter_map(|c| match c {
+                LanguageModelStreamChunk::Delta(LanguageModelStreamChunkType::TextDelta(t)) => {
+                    Some(t.clone())
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(text, "Hello");
+    }
+
     #[tokio::test]
     async fn test_generate_text_sends_request_body_without_custom_headers() {
         let server = MockServer::start().await;

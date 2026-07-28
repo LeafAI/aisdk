@@ -109,6 +109,23 @@ fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     )
 }
 
+/// Checks if a `reqwest_eventsource::Error` wraps a connection-level failure
+/// (DNS resolution, TCP connect refused/reset, TLS handshake, or a request
+/// that could never be sent — reqwest's `Kind::Request`, which renders as
+/// "error sending request for url (...)") rather than an HTTP-level
+/// rejection. These are safe to retry with backoff when they occur before
+/// any stream data has reached the caller, since nothing has been consumed
+/// yet. Status-code errors (`InvalidStatusCode`, including 429) are
+/// deliberately excluded: those still surface as stream events for the
+/// provider's own `stream_text()` retry loop to handle, unchanged.
+fn is_retryable_transport_error(err: &reqwest_eventsource::Error) -> bool {
+    matches!(
+        err,
+        reqwest_eventsource::Error::Transport(e)
+            if e.is_connect() || e.is_timeout() || e.is_request()
+    )
+}
+
 /// Parses the Retry-After header to get the wait duration.
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     headers
@@ -387,19 +404,62 @@ pub(crate) trait LanguageModelClient {
 
         let url = join_url(base_url, &self.path())?;
 
-        // Establish the event source stream directly
-        // Note: Status code errors (including 429) will be surfaced as stream events
-        // and should be handled by retry logic in the provider's stream_text() method
-        let events_stream = client
-            .request(self.method(), url.clone())
-            .headers(self.headers()?)
-            .query(&self.query_params())
-            .body(self.body()?)
-            .eventsource()
-            .map_err(|e| Error::ApiError {
-                status_code: None,
-                details: format!("SSE stream error: {e}"),
-            })?;
+        // Establishing the connection (DNS, TCP connect, TLS handshake, or
+        // handing the request off to the transport) can fail transiently —
+        // e.g. a momentary network blip, a proxy restart, or a connection
+        // reset — surfacing as a `reqwest::Error` with `Kind::Request`
+        // ("error sending request for url ..."). Nothing has been consumed
+        // from the stream yet at this point, so it's safe to retry the whole
+        // connection attempt with backoff rather than fail the turn outright.
+        // Status-code errors (including 429) are deliberately NOT retried
+        // here: those still surface as stream events for the provider's own
+        // `stream_text()` retry loop to handle, unchanged.
+        const MAX_CONNECT_RETRIES: u32 = 3;
+        let mut retry_count: u32 = 0;
+        let mut wait_time = Duration::from_millis(500);
+
+        let (first_item, raw_stream) = loop {
+            let mut es: Pin<Box<reqwest_eventsource::EventSource>> = Box::pin(
+                client
+                    .request(self.method(), url.clone())
+                    .headers(self.headers()?)
+                    .query(&self.query_params())
+                    .body(self.body()?)
+                    .eventsource()
+                    .map_err(|e| Error::ApiError {
+                        status_code: None,
+                        details: format!("SSE stream error: {e}"),
+                    })?,
+            );
+
+            match es.next().await {
+                Some(Err(err))
+                    if is_retryable_transport_error(&err) && retry_count < MAX_CONNECT_RETRIES =>
+                {
+                    retry_count += 1;
+                    log::warn!(
+                        "Streaming connection failed with retryable transport error \
+                         (attempt {retry_count}/{}): {err}. Retrying after {wait_time:?}...",
+                        MAX_CONNECT_RETRIES + 1
+                    );
+                    tokio::time::sleep(wait_time).await;
+                    wait_time *= 2;
+                    continue;
+                }
+                first => break (first, es),
+            }
+        };
+
+        // Splice the already-consumed first item (if any) back onto the
+        // front of the stream so no events are lost to the retry check above.
+        let events_stream: Pin<
+            Box<dyn Stream<Item = std::result::Result<Event, reqwest_eventsource::Error>> + Send>,
+        > = match first_item {
+            Some(item) => {
+                Box::pin(futures::stream::once(futures::future::ready(item)).chain(raw_stream))
+            }
+            None => raw_stream,
+        };
 
         // Map events to deserialized StreamEvent ( ProviderStreamEvent )
         // Filter out Event::Open (connection acknowledgement with no data) before parsing,
