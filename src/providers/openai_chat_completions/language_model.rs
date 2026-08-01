@@ -100,6 +100,13 @@ impl<M: ModelName> LanguageModel for OpenAIChatCompletions<M> {
         // `Done` until usage arrives (trailing chunk), the stream signals
         // `[DONE]`, or the connection closes — whichever comes first.
         let mut pending_text_done = false;
+        // Same deferral for `finish_reason: "tool_calls"`: the tool-call `Done`
+        // messages are stashed here when the finish chunk carried no usage, and
+        // flushed once the trailing usage chunk arrives (usage attached to the
+        // first message only, so multi-tool steps don't multiply the count) or
+        // the stream ends. Without this, every agentic (tool-calling) step from
+        // such providers reported zero usage.
+        let mut pending_tool_dones: Vec<AssistantMessage> = Vec::new();
 
         // Map stream events to SDK stream chunks
         let stream = stream.map(move |evt_res| match evt_res {
@@ -271,7 +278,13 @@ impl<M: ModelName> LanguageModel for OpenAIChatCompletions<M> {
                                 }
                             }
                             "tool_calls" | "function_call" => {
-                                // Send accumulated tool calls
+                                // Build the accumulated tool-call `Done`s. When
+                                // this finish chunk carries no usage, defer them
+                                // (like the text path above) until the trailing
+                                // usage chunk or stream end, so providers that
+                                // report usage in a separate final chunk don't
+                                // yield zero-usage tool steps.
+                                let mut dones = Vec::new();
                                 for (index, (id, name, args)) in &accumulated_tool_calls {
                                     let resolved_id = if id.is_empty() {
                                         format!("openai-tool-call-{index}")
@@ -289,14 +302,26 @@ impl<M: ModelName> LanguageModel for OpenAIChatCompletions<M> {
                                     tool_info.input(serde_json::from_str(args).unwrap_or_else(
                                         |_| serde_json::Value::Object(serde_json::Map::new()),
                                     ));
-                                    results.push(LanguageModelStreamChunk::Done(
-                                        AssistantMessage {
-                                            content: LanguageModelResponseContentType::ToolCall(
-                                                tool_info,
-                                            ),
-                                            usage: usage.clone(),
+                                    dones.push(AssistantMessage {
+                                        content: LanguageModelResponseContentType::ToolCall(
+                                            tool_info,
+                                        ),
+                                        // Attach usage to the first call only, so
+                                        // a multi-tool step isn't counted once
+                                        // per call by step-usage summation.
+                                        usage: if dones.is_empty() {
+                                            usage.clone()
+                                        } else {
+                                            None
                                         },
-                                    ));
+                                    });
+                                }
+                                if usage.is_some() {
+                                    results.extend(
+                                        dones.into_iter().map(LanguageModelStreamChunk::Done),
+                                    );
+                                } else {
+                                    pending_tool_dones = dones;
                                 }
                             }
                             "content_filter" => {
@@ -329,20 +354,28 @@ impl<M: ModelName> LanguageModel for OpenAIChatCompletions<M> {
                 // Trailing usage chunk: the provider reported `finish_reason` in
                 // an earlier chunk (deferred above) and carries token usage here,
                 // in a chunk whose choices have no `finish_reason`. Flush the
-                // deferred `Done` now so the usage is recorded.
-                if pending_text_done && let Some(u) = chunk.usage.clone() {
-                    pending_text_done = false;
-                    results.push(LanguageModelStreamChunk::Done(AssistantMessage {
-                        content: LanguageModelResponseContentType::Text(String::new()),
-                        usage: Some(u.into()),
-                    }));
+                // deferred `Done`(s) now so the usage is recorded.
+                if let Some(u) = chunk.usage.clone() {
+                    if pending_text_done {
+                        pending_text_done = false;
+                        results.push(LanguageModelStreamChunk::Done(AssistantMessage {
+                            content: LanguageModelResponseContentType::Text(String::new()),
+                            usage: Some(u.into()),
+                        }));
+                    } else if !pending_tool_dones.is_empty() {
+                        let mut dones = std::mem::take(&mut pending_tool_dones);
+                        if let Some(first) = dones.first_mut() {
+                            first.usage = Some(u.into());
+                        }
+                        results.extend(dones.into_iter().map(LanguageModelStreamChunk::Done));
+                    }
                 }
 
                 Ok(results)
             }
             Ok(types::ChatCompletionsStreamEvent::Open) => Ok(vec![]),
             Ok(types::ChatCompletionsStreamEvent::Done) => {
-                // Stream signalled `[DONE]`. If a text-completion `Done` was
+                // Stream signalled `[DONE]`. If a `Done` (text or tool-call) was
                 // deferred and no trailing usage chunk ever arrived, flush it now
                 // (without usage) so the assistant message is still recorded.
                 if pending_text_done {
@@ -351,6 +384,11 @@ impl<M: ModelName> LanguageModel for OpenAIChatCompletions<M> {
                         content: LanguageModelResponseContentType::Text(String::new()),
                         usage: None,
                     })])
+                } else if !pending_tool_dones.is_empty() {
+                    Ok(std::mem::take(&mut pending_tool_dones)
+                        .into_iter()
+                        .map(LanguageModelStreamChunk::Done)
+                        .collect())
                 } else {
                     Ok(vec![])
                 }
@@ -363,14 +401,19 @@ impl<M: ModelName> LanguageModel for OpenAIChatCompletions<M> {
             Err(e) => {
                 // A finished response whose stream closes without an explicit
                 // `[DONE]` surfaces here as a stream-end error. If we deferred a
-                // text-completion `Done`, treat this as normal termination and
-                // flush it rather than failing the turn.
+                // `Done` (text or tool-call), treat this as normal termination
+                // and flush it rather than failing the turn.
                 if pending_text_done {
                     pending_text_done = false;
                     Ok(vec![LanguageModelStreamChunk::Done(AssistantMessage {
                         content: LanguageModelResponseContentType::Text(String::new()),
                         usage: None,
                     })])
+                } else if !pending_tool_dones.is_empty() {
+                    Ok(std::mem::take(&mut pending_tool_dones)
+                        .into_iter()
+                        .map(LanguageModelStreamChunk::Done)
+                        .collect())
                 } else {
                     Err(e)
                 }
@@ -1128,5 +1171,143 @@ mod tests {
 
         assert_eq!(usage.input_tokens, Some(11));
         assert_eq!(usage.output_tokens, Some(7));
+    }
+
+    // Same trailing-usage pattern but for a tool-call step: the
+    // `finish_reason: "tool_calls"` chunk carries no usage; a later
+    // choice-less chunk holds it (agnes and OpenAI with
+    // `stream_options.include_usage` both do this). The tool-call `Done`
+    // must be deferred and flushed with that usage attached.
+    async fn spawn_sse_server_tool_call_trailing_usage() -> (String, tokio::task::JoinHandle<String>)
+    {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have address");
+
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("server should accept");
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 1024];
+
+            loop {
+                let read = socket
+                    .read(&mut chunk)
+                    .await
+                    .expect("request should be readable");
+                if read == 0 {
+                    break;
+                }
+
+                buffer.extend_from_slice(&chunk[..read]);
+
+                if let Some(headers_end) =
+                    buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let headers_end = headers_end + 4;
+                    let request = String::from_utf8_lossy(&buffer).to_string();
+                    let body_length = content_length(&request);
+                    if buffer.len() >= headers_end + body_length {
+                        break;
+                    }
+                }
+            }
+
+            let request = String::from_utf8(buffer).expect("request should be valid utf-8");
+            let response_body = concat!(
+                "data: {",
+                "\"id\":\"chatcmpl-2\",",
+                "\"object\":\"chat.completion.chunk\",",
+                "\"created\":0,",
+                "\"model\":\"gpt-4o-mini\",",
+                "\"choices\":[{",
+                "\"index\":0,",
+                "\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",",
+                "\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}]},",
+                "\"finish_reason\":null",
+                "}]",
+                "}\n\n",
+                "data: {",
+                "\"id\":\"chatcmpl-2\",",
+                "\"object\":\"chat.completion.chunk\",",
+                "\"created\":0,",
+                "\"model\":\"gpt-4o-mini\",",
+                "\"choices\":[{",
+                "\"index\":0,",
+                "\"delta\":{},",
+                "\"finish_reason\":\"tool_calls\"",
+                "}]",
+                "}\n\n",
+                "data: {",
+                "\"id\":\"chatcmpl-2\",",
+                "\"object\":\"chat.completion.chunk\",",
+                "\"created\":0,",
+                "\"model\":\"gpt-4o-mini\",",
+                "\"choices\":[],",
+                "\"usage\":{\"prompt_tokens\":555,\"completion_tokens\":63,\"total_tokens\":618}",
+                "}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("response should be writable");
+
+            request
+        });
+
+        (format!("http://{}", address), handle)
+    }
+
+    #[tokio::test]
+    async fn test_stream_tool_call_captures_trailing_usage_chunk() {
+        let (base_url, request_handle) = spawn_sse_server_tool_call_trailing_usage().await;
+
+        let mut model = test_model(base_url);
+        let mut stream = model
+            .stream_text(LanguageModelOptions {
+                messages: vec![Message::User("Weather in Paris?".to_string().into()).into()],
+                ..Default::default()
+            })
+            .await
+            .expect("stream request should succeed");
+
+        let mut chunks = Vec::new();
+        while let Ok(Some(item)) = tokio::time::timeout(Duration::from_secs(1), stream.next()).await
+        {
+            chunks.extend(item.expect("stream event should parse"));
+        }
+
+        let _ = request_handle
+            .await
+            .expect("request capture should succeed");
+
+        let done = chunks
+            .iter()
+            .find_map(|chunk| match chunk {
+                LanguageModelStreamChunk::Done(message) => Some(message.clone()),
+                _ => None,
+            })
+            .expect("stream should emit a tool-call Done chunk");
+
+        assert!(
+            matches!(
+                &done.content,
+                LanguageModelResponseContentType::ToolCall(info) if info.tool.name == "get_weather"
+            ),
+            "Done must carry the tool call, got: {:?}",
+            done.content
+        );
+        let usage = done
+            .usage
+            .expect("tool-call Done must carry usage from the trailing chunk");
+        assert_eq!(usage.input_tokens, Some(555));
+        assert_eq!(usage.output_tokens, Some(63));
     }
 }
