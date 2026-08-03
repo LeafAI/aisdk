@@ -34,6 +34,7 @@ impl From<LanguageModelOptions> for client::ChatCompletionsOptions {
                 .into_iter()
                 .map(|tagged| tagged.message.into()),
         );
+        merge_consecutive_tool_call_messages(&mut messages);
 
         let tools: Option<Vec<types::Tool>> = options.tools.map(|tool_list| {
             tool_list
@@ -124,6 +125,62 @@ impl From<LanguageModelOptions> for client::ChatCompletionsOptions {
             extra_headers,
         }
     }
+}
+
+/// Merges runs of consecutive assistant messages that each carry `tool_calls`
+/// (with no tool-result message between them) into a single assistant message
+/// whose `tool_calls` is the concatenation.
+///
+/// The SDK's message model stores a parallel tool call as one
+/// `Message::Assistant(ToolCall)` per call, so a history recorded that way
+/// converts to several single-call assistant messages in a row. Anthropic's
+/// API accepts that shape, but OpenAI-compatible chat-completions endpoints
+/// (OpenAI, DeepSeek, ...) reject it with HTTP 400: "An assistant message
+/// with 'tool_calls' must be followed by tool messages responding to each
+/// 'tool_call_id'." Merging the run restores the canonical
+/// `assistant(tool_calls=[a, b]) / tool(a) / tool(b)` shape, so a session
+/// recorded under an Anthropic-shaped provider can be resumed against an
+/// OpenAI-shaped one. Text and reasoning from the merged messages are
+/// concatenated (newline-separated, empty parts skipped); already-canonical
+/// histories pass through unchanged.
+fn merge_consecutive_tool_call_messages(messages: &mut Vec<types::ChatMessage>) {
+    let mut merged: Vec<types::ChatMessage> = Vec::with_capacity(messages.len());
+    for msg in messages.drain(..) {
+        let is_assistant_tool_call = msg.role == types::Role::Assistant
+            && msg.tool_calls.as_ref().is_some_and(|c| !c.is_empty());
+        if is_assistant_tool_call
+            && let Some(prev) = merged.last_mut()
+            && prev.role == types::Role::Assistant
+            && prev.tool_calls.as_ref().is_some_and(|c| !c.is_empty())
+        {
+            if let (Some(prev_calls), Some(new_calls)) = (prev.tool_calls.as_mut(), msg.tool_calls)
+            {
+                prev_calls.extend(new_calls);
+            }
+            // Fold non-empty text/reasoning into the surviving message.
+            if let Some(text) = msg.content.filter(|t| !t.is_empty()) {
+                match prev.content.as_mut().filter(|t| !t.is_empty()) {
+                    Some(existing) => {
+                        existing.push('\n');
+                        existing.push_str(&text);
+                    }
+                    None => prev.content = Some(text),
+                }
+            }
+            if let Some(reasoning) = msg.reasoning_content.filter(|r| !r.is_empty()) {
+                match prev.reasoning_content.as_mut().filter(|r| !r.is_empty()) {
+                    Some(existing) => {
+                        existing.push('\n');
+                        existing.push_str(&reasoning);
+                    }
+                    None => prev.reasoning_content = Some(reasoning),
+                }
+            }
+        } else {
+            merged.push(msg);
+        }
+    }
+    *messages = merged;
 }
 
 // ============================================================================
@@ -706,5 +763,161 @@ mod tests {
         assert_eq!(sdk_usage.cached_tokens, Some(20));
         assert_eq!(sdk_usage.reasoning_tokens, Some(10));
         assert_eq!(sdk_usage.cache_miss_tokens, Some(30));
+    }
+
+    /// Helper: a `ChatMessage` assistant carrying exactly one tool call.
+    fn assistant_tool_call(id: &str, name: &str) -> types::ChatMessage {
+        types::ChatMessage {
+            role: types::Role::Assistant,
+            content: Some(String::new()),
+            name: None,
+            tool_calls: Some(vec![types::ToolCall {
+                id: id.to_string(),
+                type_: "function".to_string(),
+                function: types::FunctionCall {
+                    name: name.to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn tool_result(id: &str) -> types::ChatMessage {
+        types::ChatMessage {
+            role: types::Role::Tool,
+            content: Some("ok".to_string()),
+            name: Some("t".to_string()),
+            tool_calls: None,
+            tool_call_id: Some(id.to_string()),
+            reasoning_content: None,
+        }
+    }
+
+    fn user(text: &str) -> types::ChatMessage {
+        types::ChatMessage {
+            role: types::Role::User,
+            content: Some(text.to_string()),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    /// A parallel tool call recorded as one assistant message per call (the
+    /// Anthropic-shaped history) must merge into a single assistant message
+    /// with both calls, so OpenAI-shaped endpoints accept it.
+    #[test]
+    fn test_merge_consecutive_single_call_assistants() {
+        let mut msgs = vec![
+            user("go"),
+            assistant_tool_call("a", "file_read"),
+            assistant_tool_call("b", "directory_list"),
+            tool_result("a"),
+            tool_result("b"),
+        ];
+        merge_consecutive_tool_call_messages(&mut msgs);
+        assert_eq!(msgs.len(), 4);
+        let calls = msgs[1].tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "a");
+        assert_eq!(calls[1].id, "b");
+        assert_eq!(msgs[2].tool_call_id.as_deref(), Some("a"));
+        assert_eq!(msgs[3].tool_call_id.as_deref(), Some("b"));
+    }
+
+    /// Sequential (already canonical) call groups are left untouched: a tool
+    /// result between two tool-call assistants breaks the run.
+    #[test]
+    fn test_merge_leaves_sequential_groups_alone() {
+        let mut msgs = vec![
+            assistant_tool_call("a", "file_read"),
+            tool_result("a"),
+            assistant_tool_call("b", "shell_exec"),
+            tool_result("b"),
+        ];
+        let before = msgs.clone();
+        merge_consecutive_tool_call_messages(&mut msgs);
+        assert_eq!(msgs, before);
+    }
+
+    /// Plain assistant text between tool-call assistants also breaks the run
+    /// (no merging across a message without tool_calls).
+    #[test]
+    fn test_merge_does_not_cross_plain_assistant_text() {
+        let plain = types::ChatMessage {
+            role: types::Role::Assistant,
+            content: Some("thinking aloud".to_string()),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let mut msgs = vec![
+            assistant_tool_call("a", "file_read"),
+            plain.clone(),
+            assistant_tool_call("b", "shell_exec"),
+        ];
+        merge_consecutive_tool_call_messages(&mut msgs);
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1], plain);
+    }
+
+    /// Text and reasoning from merged messages are concatenated, empty parts
+    /// skipped.
+    #[test]
+    fn test_merge_concatenates_text_and_reasoning() {
+        let mut first = assistant_tool_call("a", "x");
+        first.content = Some("part one".to_string());
+        let mut second = assistant_tool_call("b", "y");
+        second.content = Some("part two".to_string());
+        second.reasoning_content = Some("because".to_string());
+        let mut msgs = vec![first, second];
+        merge_consecutive_tool_call_messages(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content.as_deref(), Some("part one\npart two"));
+        assert_eq!(msgs[0].reasoning_content.as_deref(), Some("because"));
+        assert_eq!(msgs[0].tool_calls.as_ref().unwrap().len(), 2);
+    }
+
+    /// End-to-end through the options conversion: SDK messages recorded as
+    /// per-call assistants come out merged in ChatCompletionsOptions.
+    #[test]
+    fn test_options_conversion_merges_parallel_tool_call_history() {
+        let mk_call = |id: &str, name: &str| {
+            let mut tc = crate::core::tools::ToolCallInfo::new(name);
+            tc.id(id.to_string());
+            tc.input(json!({}));
+            Message::Assistant(crate::core::messages::AssistantMessage::new(
+                LanguageModelResponseContentType::ToolCall(tc),
+                None,
+            ))
+        };
+        let mk_result = |id: &str, name: &str| {
+            Message::Tool(ToolResultInfo {
+                tool: crate::core::tools::ToolDetails {
+                    name: name.to_string(),
+                    id: id.to_string(),
+                },
+                output: Ok(json!("done")),
+            })
+        };
+        let options = LanguageModelOptions {
+            messages: vec![
+                Message::User("go".to_string().into()).into(),
+                mk_call("a", "file_read").into(),
+                mk_call("b", "directory_list").into(),
+                mk_result("a", "file_read").into(),
+                mk_result("b", "directory_list").into(),
+            ],
+            ..Default::default()
+        };
+        let opts: client::ChatCompletionsOptions = options.into();
+        // user, merged assistant, tool a, tool b
+        assert_eq!(opts.messages.len(), 4);
+        assert_eq!(opts.messages[1].role, types::Role::Assistant);
+        assert_eq!(opts.messages[1].tool_calls.as_ref().unwrap().len(), 2);
     }
 }
