@@ -175,9 +175,11 @@ impl From<types::ResponseUsage> for Usage {
 impl From<ReasoningEffort> for types::ReasoningEffort {
     fn from(value: ReasoningEffort) -> Self {
         match value {
-            ReasoningEffort::Low => client::ReasoningEffort::Minimal,
+            ReasoningEffort::None => client::ReasoningEffort::None,
+            ReasoningEffort::Low => client::ReasoningEffort::Low,
             ReasoningEffort::Medium => client::ReasoningEffort::Medium,
             ReasoningEffort::High => client::ReasoningEffort::High,
+            ReasoningEffort::XHigh => client::ReasoningEffort::XHigh,
         }
     }
 }
@@ -357,10 +359,17 @@ mod tests {
     }
 
     #[test]
+    fn test_reasoning_effort_conversion_none() {
+        let effort = LMReasoningEffort::None;
+        let openai_effort: ReasoningEffort = effort.into();
+        assert_eq!(openai_effort, ReasoningEffort::None);
+    }
+
+    #[test]
     fn test_reasoning_effort_conversion_low() {
         let effort = LMReasoningEffort::Low;
         let openai_effort: ReasoningEffort = effort.into();
-        assert_eq!(openai_effort, ReasoningEffort::Minimal);
+        assert_eq!(openai_effort, ReasoningEffort::Low);
         let _ = openai_effort;
     }
 
@@ -379,6 +388,26 @@ mod tests {
     }
 
     #[test]
+    fn test_reasoning_effort_conversion_xhigh() {
+        let effort = LMReasoningEffort::XHigh;
+        let openai_effort: ReasoningEffort = effort.into();
+        assert_eq!(openai_effort, ReasoningEffort::XHigh);
+    }
+
+    #[test]
+    fn test_language_model_options_to_create_response_with_reasoning_effort_none() {
+        let options = LanguageModelOptions {
+            reasoning_effort: Some(LMReasoningEffort::None),
+            ..Default::default()
+        };
+        let lm_options: OpenAILanguageModelOptions = options.into();
+        assert!(lm_options.reasoning.is_some());
+        let reasoning = lm_options.reasoning.unwrap();
+        assert_eq!(reasoning.effort, Some(ReasoningEffort::None));
+        assert_eq!(reasoning.summary, Some(SummaryType::Auto));
+    }
+
+    #[test]
     fn test_language_model_options_to_create_response_with_reasoning_effort_low() {
         let options = LanguageModelOptions {
             reasoning_effort: Some(LMReasoningEffort::Low),
@@ -387,7 +416,7 @@ mod tests {
         let lm_options: OpenAILanguageModelOptions = options.into();
         assert!(lm_options.reasoning.is_some());
         let reasoning = lm_options.reasoning.unwrap();
-        assert_eq!(reasoning.effort, Some(ReasoningEffort::Minimal));
+        assert_eq!(reasoning.effort, Some(ReasoningEffort::Low));
         assert_eq!(reasoning.summary, Some(SummaryType::Auto));
     }
 
@@ -414,6 +443,19 @@ mod tests {
         assert!(lm_options.reasoning.is_some());
         let reasoning = lm_options.reasoning.unwrap();
         assert_eq!(reasoning.effort, Some(ReasoningEffort::High));
+        assert_eq!(reasoning.summary, Some(SummaryType::Auto));
+    }
+
+    #[test]
+    fn test_language_model_options_to_create_response_with_reasoning_effort_xhigh() {
+        let options = LanguageModelOptions {
+            reasoning_effort: Some(LMReasoningEffort::XHigh),
+            ..Default::default()
+        };
+        let lm_options: OpenAILanguageModelOptions = options.into();
+        assert!(lm_options.reasoning.is_some());
+        let reasoning = lm_options.reasoning.unwrap();
+        assert_eq!(reasoning.effort, Some(ReasoningEffort::XHigh));
         assert_eq!(reasoning.summary, Some(SummaryType::Auto));
     }
 
