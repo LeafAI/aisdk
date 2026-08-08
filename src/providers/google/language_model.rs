@@ -469,7 +469,7 @@ mod tests {
             .temperature(70u32)
             .top_p(80u32)
             .stop_sequences(vec!["END".to_string()])
-            .frequency_penalty(0.5)
+            .frequency_penalty(0.5_f32)
             .build()
             .generate_text()
             .await
@@ -505,7 +505,7 @@ mod tests {
         let response = LanguageModelRequest::builder()
             .model(test_model(server.uri()))
             .messages(vec![Message::User("Hello".to_string().into())])
-            .frequency_penalty(0.5)
+            .frequency_penalty(0.5_f32)
             .headers(HashMap::from([(
                 "x-trace-id".to_string(),
                 "trace-123".to_string(),
@@ -584,7 +584,7 @@ mod tests {
             .temperature(70u32)
             .top_p(80u32)
             .stop_sequences(vec!["END".to_string()])
-            .frequency_penalty(0.5)
+            .frequency_penalty(0.5_f32)
             .build();
 
         let mut stream = request
