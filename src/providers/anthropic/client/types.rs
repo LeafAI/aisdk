@@ -174,14 +174,94 @@ pub enum AnthropicUserMessageContentBlock {
         /// The text content
         text: String,
     },
+    #[serde(rename = "image")]
+    /// Image content, provided inline as base64.
+    ///
+    /// See more [here](https://platform.claude.com/docs/en/build-with-claude/vision).
+    Image {
+        /// The base64-encoded image source.
+        source: AnthropicImageSource,
+    },
     #[serde(rename = "tool_result")]
-    /// Tool result content
+    /// Tool result content. `content` is either a plain string (the common
+    /// case) or a list of blocks -- Anthropic accepts `text`/`image` blocks
+    /// inside a `tool_result`, which lets a vision-capable tool (e.g. a
+    /// media-reading tool) return an image directly in its result rather
+    /// than only in a separate top-level user turn.
     ToolResult {
         /// The ID of the tool used
         tool_use_id: String,
-        /// The content of the tool result
-        content: String,
+        /// The content of the tool result: plain text, or a list of
+        /// text/image blocks.
+        content: AnthropicToolResultContent,
     },
+}
+
+/// A `tool_result` block's `content` field: either a plain string (the
+/// common, text-only case) or a list of blocks so a tool result can embed
+/// an image alongside its text (e.g. `[{"type":"text",...},{"type":"image",...}]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AnthropicToolResultContent {
+    /// Plain text result -- the common case.
+    Text(String),
+    /// One or more text/image blocks.
+    Blocks(Vec<AnthropicToolResultBlock>),
+}
+
+impl From<String> for AnthropicToolResultContent {
+    fn from(value: String) -> Self {
+        Self::Text(value)
+    }
+}
+
+/// A single block inside a `tool_result`'s `content` array. Deliberately a
+/// narrower enum than [`AnthropicUserMessageContentBlock`] -- Anthropic's
+/// `tool_result.content` only accepts `text`/`image` blocks, not
+/// `tool_result` itself (nesting) or other block kinds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum AnthropicToolResultBlock {
+    #[serde(rename = "text")]
+    /// Regular text content
+    Text {
+        /// The text content
+        text: String,
+    },
+    #[serde(rename = "image")]
+    /// Image content, provided inline as base64.
+    Image {
+        /// The base64-encoded image source.
+        source: AnthropicImageSource,
+    },
+}
+
+/// A base64-encoded image source for an `image` content block. Only the
+/// `base64` source type is modeled -- Anthropic also supports `url`, but
+/// drift's media pipeline always sends inline base64 data (an `image_read`-
+/// style tool already has the file's bytes in hand; there's no URL to
+/// forward).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnthropicImageSource {
+    /// Always `"base64"` for this source shape.
+    #[serde(rename = "type")]
+    pub source_type: String,
+    /// MIME type of the encoded image, e.g. `"image/png"`.
+    pub media_type: String,
+    /// Raw base64-encoded image bytes, without a `data:`-URI prefix.
+    pub data: String,
+}
+
+impl AnthropicImageSource {
+    /// Builds a `base64`-sourced image block from raw base64 data and its
+    /// MIME type.
+    pub fn base64(media_type: impl Into<String>, data: impl Into<String>) -> Self {
+        Self {
+            source_type: "base64".to_string(),
+            media_type: media_type.into(),
+            data: data.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

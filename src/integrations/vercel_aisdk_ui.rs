@@ -842,6 +842,7 @@ mod tests {
                 name: "get_weather".to_string(),
             },
             output: Err(Error::Other("weather service unavailable".to_string())),
+            ..Default::default()
         };
 
         let chunks = map_language_model_chunk_to_vercel_ui(

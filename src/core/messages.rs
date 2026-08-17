@@ -104,18 +104,69 @@ impl From<&str> for SystemMessage {
     }
 }
 
-/// A user message containing input from the human participant.
+/// A base64-encoded media attachment (image, audio, or other binary content)
+/// carried alongside a message's text. Providers that support multimodal
+/// input (Anthropic, OpenAI) render each entry as a native content block
+/// (e.g. Anthropic's `{"type": "image", "source": {"type": "base64", ...}}`);
+/// providers/paths with no multimodal support simply drop `media` and send
+/// `content` alone, so a message with media attached degrades gracefully to
+/// text-only elsewhere in the SDK.
 #[derive(Debug, Clone)]
+pub struct MediaContent {
+    /// Raw base64-encoded payload, without a `data:`-URI prefix.
+    pub data: String,
+    /// MIME type describing the encoded payload (e.g. `image/png`,
+    /// `audio/wav`). Providers use this both to select the correct request
+    /// block shape and, for images, to validate against their supported
+    /// format list.
+    pub mime_type: String,
+}
+
+impl MediaContent {
+    /// Creates a new media attachment from base64 data and its MIME type.
+    pub fn new(data: impl Into<String>, mime_type: impl Into<String>) -> Self {
+        Self {
+            data: data.into(),
+            mime_type: mime_type.into(),
+        }
+    }
+
+    /// Whether this attachment's MIME type is an image (`image/*`), the only
+    /// media kind current provider conversions render as native content
+    /// blocks. Non-image media (audio, video, ...) is accepted by the type
+    /// but provider conversions currently drop it -- callers can use this to
+    /// warn ahead of a silent drop.
+    pub fn is_image(&self) -> bool {
+        self.mime_type.starts_with("image/")
+    }
+}
+
+/// A user message containing input from the human participant.
+#[derive(Debug, Clone, Default)]
 pub struct UserMessage {
     /// The text content of the user message.
     pub content: String,
+    /// Media attachments (images, etc.) carried alongside `content`. Empty
+    /// for a plain-text message -- the common case -- so every existing
+    /// `UserMessage::new`/`From<String>` construction is unaffected.
+    pub media: Vec<MediaContent>,
 }
 
 impl UserMessage {
-    /// Creates a new user message with the given content.
+    /// Creates a new user message with the given content and no media.
     pub fn new(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            media: Vec::new(),
+        }
+    }
+
+    /// Creates a new user message with both text content and media
+    /// attachments (e.g. an image pasted alongside a question about it).
+    pub fn with_media(content: impl Into<String>, media: Vec<MediaContent>) -> Self {
+        Self {
+            content: content.into(),
+            media,
         }
     }
 }

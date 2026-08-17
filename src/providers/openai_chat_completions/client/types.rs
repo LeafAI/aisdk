@@ -80,7 +80,7 @@ pub(crate) struct ChatMessage {
     pub role: Role,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<ChatMessageContent>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -93,6 +93,70 @@ pub(crate) struct ChatMessage {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+}
+
+/// A `ChatMessage.content` value: plain text (the common case, and the only
+/// shape a response ever carries) or a list of parts (text/image) -- the
+/// shape the API requires once an image is attached to a user or tool
+/// message. `#[serde(untagged)]` matches the API's actual contract: `content`
+/// is documented as `string | array` interchangeably.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub(crate) enum ChatMessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+impl ChatMessageContent {
+    /// The plain-text view of this content: the string itself for `Text`,
+    /// or every `Text` part joined with newlines for `Parts` (image parts
+    /// contribute nothing -- there is no textual representation of an
+    /// image to fall back to here).
+    pub fn text(&self) -> String {
+        match self {
+            Self::Text(s) => s.clone(),
+            Self::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    ContentPart::ImageUrl { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+
+    /// Whether this content carries no visible text and no parts at all --
+    /// used by the tool-call-message merge pass, which only ever folds text
+    /// (assistant tool-call turns never carry `Parts`/media).
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Text(s) => s.is_empty(),
+            Self::Parts(parts) => parts.is_empty(),
+        }
+    }
+}
+
+impl From<String> for ChatMessageContent {
+    fn from(value: String) -> Self {
+        Self::Text(value)
+    }
+}
+
+/// One part of a multi-part `content` array: text or an inline (base64
+/// data-URI) image. Mirrors the OpenAI Chat Completions vision request
+/// shape: `{"type": "text", "text": "..."}` /
+/// `{"type": "image_url", "image_url": {"url": "data:<mime>;base64,<data>"}}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum ContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrl },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct ImageUrl {
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

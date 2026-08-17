@@ -44,8 +44,17 @@ impl<M: ModelName> LanguageModel for OpenAIChatCompletions<M> {
                 });
             }
 
-            // Handle text content
-            if let Some(text) = choice.message.content
+            // Handle text content. A response's `content` is always a plain
+            // string per the API spec (only requests support the array-of-
+            // parts shape used for inline images), but `.text()` handles
+            // both uniformly since `content` is the same shared type as a
+            // request message's.
+            let text = choice
+                .message
+                .content
+                .as_ref()
+                .map(types::ChatMessageContent::text);
+            if let Some(text) = text
                 && !text.is_empty()
             {
                 contents.push(LanguageModelResponseContentType::Text(text));

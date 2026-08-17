@@ -20,7 +20,7 @@ impl From<LanguageModelOptions> for client::ChatCompletionsOptions {
         if let Some(system_prompt) = options.system {
             messages.push(types::ChatMessage {
                 role: types::Role::System,
-                content: Some(system_prompt),
+                content: Some(system_prompt.into()),
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
@@ -158,13 +158,23 @@ fn merge_consecutive_tool_call_messages(messages: &mut Vec<types::ChatMessage>) 
                 prev_calls.extend(new_calls);
             }
             // Fold non-empty text/reasoning into the surviving message.
-            if let Some(text) = msg.content.filter(|t| !t.is_empty()) {
-                match prev.content.as_mut().filter(|t| !t.is_empty()) {
-                    Some(existing) => {
-                        existing.push('\n');
-                        existing.push_str(&text);
+            // Assistant tool-call turns never carry `Parts`/media (only a
+            // model's own tool_use/text ever lands here, and models don't
+            // attach images to their own tool calls), so merging as plain
+            // text -- via `ChatMessageContent::text()` -- never drops an
+            // image that would otherwise need preserving.
+            let text = msg
+                .content
+                .as_ref()
+                .map(types::ChatMessageContent::text)
+                .unwrap_or_default();
+            if !text.is_empty() {
+                match prev.content.as_mut() {
+                    Some(existing) if !existing.is_empty() => {
+                        let merged_text = format!("{}\n{text}", existing.text());
+                        *existing = types::ChatMessageContent::Text(merged_text);
                     }
-                    None => prev.content = Some(text),
+                    _ => prev.content = Some(types::ChatMessageContent::Text(text)),
                 }
             }
             if let Some(reasoning) = msg.reasoning_content.filter(|r| !r.is_empty()) {
@@ -192,7 +202,7 @@ impl From<Message> for types::ChatMessage {
         match msg {
             Message::System(s) => types::ChatMessage {
                 role: types::Role::System,
-                content: Some(s.content),
+                content: Some(s.content.into()),
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
@@ -200,7 +210,7 @@ impl From<Message> for types::ChatMessage {
             },
             Message::User(u) => types::ChatMessage {
                 role: types::Role::User,
-                content: Some(u.content),
+                content: Some(user_message_content(&u.content, &u.media)),
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
@@ -209,7 +219,7 @@ impl From<Message> for types::ChatMessage {
             Message::Assistant(a) => match a.content {
                 LanguageModelResponseContentType::Text(text) => types::ChatMessage {
                     role: types::Role::Assistant,
-                    content: Some(text),
+                    content: Some(text.into()),
                     name: None,
                     tool_calls: None,
                     tool_call_id: None,
@@ -217,7 +227,7 @@ impl From<Message> for types::ChatMessage {
                 },
                 LanguageModelResponseContentType::ToolCall(tool_info) => types::ChatMessage {
                     role: types::Role::Assistant,
-                    content: Some("".to_string()),
+                    content: Some("".to_string().into()),
                     name: None,
                     tool_calls: Some(vec![types::ToolCall {
                         id: tool_info.tool.id.clone(),
@@ -232,7 +242,7 @@ impl From<Message> for types::ChatMessage {
                 },
                 LanguageModelResponseContentType::Reasoning { content, .. } => types::ChatMessage {
                     role: types::Role::Assistant,
-                    content: Some(String::new()),
+                    content: Some(String::new().into()),
                     name: None,
                     tool_calls: None,
                     tool_call_id: None,
@@ -263,7 +273,7 @@ impl From<Message> for types::ChatMessage {
                     };
                     types::ChatMessage {
                         role: types::Role::Assistant,
-                        content: Some(text),
+                        content: Some(text.into()),
                         name: None,
                         tool_calls: tc_list,
                         tool_call_id: None,
@@ -279,22 +289,29 @@ impl From<Message> for types::ChatMessage {
                     reasoning_content: None,
                 },
             },
-            Message::Tool(tool_result) => types::ChatMessage {
-                role: types::Role::Tool,
-                content: Some(
-                    tool_result
-                        .output
-                        .unwrap_or_else(|e| serde_json::Value::String(e.to_string()))
-                        .to_string(),
-                ),
-                name: Some(tool_result.tool.name),
-                tool_calls: None,
-                tool_call_id: Some(tool_result.tool.id),
-                reasoning_content: None,
-            },
+            Message::Tool(tool_result) => {
+                let text = tool_result
+                    .output
+                    .unwrap_or_else(|e| serde_json::Value::String(e.to_string()))
+                    .to_string();
+                types::ChatMessage {
+                    role: types::Role::Tool,
+                    // Chat Completions' `tool` role only ever accepts a plain
+                    // string `content` -- unlike `user`, it has no
+                    // array-of-parts shape for inline images -- so a tool
+                    // result's `media` (if any) is silently dropped here.
+                    // Vision-capable tool results are only meaningfully
+                    // supported on the Responses API and Anthropic paths.
+                    content: Some(text.into()),
+                    name: Some(tool_result.tool.name),
+                    tool_calls: None,
+                    tool_call_id: Some(tool_result.tool.id),
+                    reasoning_content: None,
+                }
+            }
             Message::Developer(d) => types::ChatMessage {
                 role: types::Role::Developer,
-                content: Some(d),
+                content: Some(d.into()),
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
@@ -302,6 +319,35 @@ impl From<Message> for types::ChatMessage {
             },
         }
     }
+}
+
+/// Builds a user message's `content` value: plain text when there's no
+/// media (the common case, avoiding the array shape most endpoints see far
+/// more testing/support for), or a `Parts` array with each image first and
+/// the text last when media is attached -- matching the ordering used for
+/// the other providers' conversions.
+fn user_message_content(
+    text: &str,
+    media: &[crate::core::messages::MediaContent],
+) -> types::ChatMessageContent {
+    if media.is_empty() {
+        return types::ChatMessageContent::Text(text.to_string());
+    }
+    let mut parts: Vec<types::ContentPart> = media
+        .iter()
+        .filter(|m| m.is_image())
+        .map(|m| types::ContentPart::ImageUrl {
+            image_url: types::ImageUrl {
+                url: format!("data:{};base64,{}", m.mime_type, m.data),
+            },
+        })
+        .collect();
+    if !text.is_empty() {
+        parts.push(types::ContentPart::Text {
+            text: text.to_string(),
+        });
+    }
+    types::ChatMessageContent::Parts(parts)
 }
 
 // ============================================================================
@@ -387,7 +433,7 @@ mod tests {
         let chat_msg: types::ChatMessage = msg.into();
 
         assert_eq!(chat_msg.role, types::Role::System);
-        assert_eq!(chat_msg.content, Some("You are helpful".to_string()));
+        assert_eq!(chat_msg.content, Some("You are helpful".to_string().into()));
         assert!(chat_msg.tool_calls.is_none());
     }
 
@@ -397,7 +443,33 @@ mod tests {
         let chat_msg: types::ChatMessage = msg.into();
 
         assert_eq!(chat_msg.role, types::Role::User);
-        assert_eq!(chat_msg.content, Some("Hello".to_string()));
+        assert_eq!(chat_msg.content, Some("Hello".to_string().into()));
+    }
+
+    #[test]
+    fn test_message_conversion_user_with_image_media() {
+        use crate::core::messages::MediaContent;
+        let msg = Message::User(crate::core::messages::UserMessage::with_media(
+            "what is this?",
+            vec![MediaContent::new("aGVsbG8=", "image/png")],
+        ));
+        let chat_msg: types::ChatMessage = msg.into();
+
+        match chat_msg.content {
+            Some(types::ChatMessageContent::Parts(parts)) => {
+                assert_eq!(parts.len(), 2, "image part + text part");
+                assert!(matches!(
+                    &parts[0],
+                    types::ContentPart::ImageUrl { image_url }
+                        if image_url.url == "data:image/png;base64,aGVsbG8="
+                ));
+                assert!(matches!(
+                    &parts[1],
+                    types::ContentPart::Text { text } if text == "what is this?"
+                ));
+            }
+            other => panic!("expected Parts content with an image, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -463,13 +535,19 @@ mod tests {
         assert_eq!(completions_opts.messages.len(), 2);
         assert_eq!(completions_opts.messages[0].role, types::Role::System);
         assert_eq!(
-            completions_opts.messages[0].content.as_deref(),
-            Some("You are helpful")
+            completions_opts.messages[0]
+                .content
+                .as_ref()
+                .map(types::ChatMessageContent::text),
+            Some("You are helpful".to_string())
         );
         assert_eq!(completions_opts.messages[1].role, types::Role::User);
         assert_eq!(
-            completions_opts.messages[1].content.as_deref(),
-            Some("Hello")
+            completions_opts.messages[1]
+                .content
+                .as_ref()
+                .map(types::ChatMessageContent::text),
+            Some("Hello".to_string())
         );
         assert!(matches!(
             completions_opts.stop,
@@ -601,7 +679,13 @@ mod tests {
             chat_msg.reasoning_content.as_deref(),
             Some("Let me think...")
         );
-        assert_eq!(chat_msg.content.as_deref(), Some("The answer is 42"));
+        assert_eq!(
+            chat_msg
+                .content
+                .as_ref()
+                .map(types::ChatMessageContent::text),
+            Some("The answer is 42".to_string())
+        );
         assert!(chat_msg.tool_calls.is_none());
     }
 
@@ -646,6 +730,7 @@ mod tests {
                         id: format!("call_{i}_0"),
                     },
                     output: Ok(serde_json::json!({"content": format!("content of file {}", i)})),
+                    ..Default::default()
                 })
                 .into(),
             );
@@ -656,6 +741,7 @@ mod tests {
                         id: format!("call_{i}_1"),
                     },
                     output: Ok(serde_json::json!({"matches": [format!("file{}.kt", i)]})),
+                    ..Default::default()
                 })
                 .into(),
             );
@@ -666,6 +752,7 @@ mod tests {
                         id: format!("call_{i}_2"),
                     },
                     output: Ok(serde_json::json!({"results": []})),
+                    ..Default::default()
                 })
                 .into(),
             );
@@ -769,7 +856,7 @@ mod tests {
     fn assistant_tool_call(id: &str, name: &str) -> types::ChatMessage {
         types::ChatMessage {
             role: types::Role::Assistant,
-            content: Some(String::new()),
+            content: Some(String::new().into()),
             name: None,
             tool_calls: Some(vec![types::ToolCall {
                 id: id.to_string(),
@@ -787,7 +874,7 @@ mod tests {
     fn tool_result(id: &str) -> types::ChatMessage {
         types::ChatMessage {
             role: types::Role::Tool,
-            content: Some("ok".to_string()),
+            content: Some("ok".to_string().into()),
             name: Some("t".to_string()),
             tool_calls: None,
             tool_call_id: Some(id.to_string()),
@@ -798,7 +885,7 @@ mod tests {
     fn user(text: &str) -> types::ChatMessage {
         types::ChatMessage {
             role: types::Role::User,
-            content: Some(text.to_string()),
+            content: Some(text.to_string().into()),
             name: None,
             tool_calls: None,
             tool_call_id: None,
@@ -849,7 +936,7 @@ mod tests {
     fn test_merge_does_not_cross_plain_assistant_text() {
         let plain = types::ChatMessage {
             role: types::Role::Assistant,
-            content: Some("thinking aloud".to_string()),
+            content: Some("thinking aloud".to_string().into()),
             name: None,
             tool_calls: None,
             tool_call_id: None,
@@ -870,14 +957,20 @@ mod tests {
     #[test]
     fn test_merge_concatenates_text_and_reasoning() {
         let mut first = assistant_tool_call("a", "x");
-        first.content = Some("part one".to_string());
+        first.content = Some("part one".to_string().into());
         let mut second = assistant_tool_call("b", "y");
-        second.content = Some("part two".to_string());
+        second.content = Some("part two".to_string().into());
         second.reasoning_content = Some("because".to_string());
         let mut msgs = vec![first, second];
         merge_consecutive_tool_call_messages(&mut msgs);
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].content.as_deref(), Some("part one\npart two"));
+        assert_eq!(
+            msgs[0]
+                .content
+                .as_ref()
+                .map(types::ChatMessageContent::text),
+            Some("part one\npart two".to_string())
+        );
         assert_eq!(msgs[0].reasoning_content.as_deref(), Some("because"));
         assert_eq!(msgs[0].tool_calls.as_ref().unwrap().len(), 2);
     }
@@ -902,6 +995,7 @@ mod tests {
                     id: id.to_string(),
                 },
                 output: Ok(json!("done")),
+                ..Default::default()
             })
         };
         let options = LanguageModelOptions {

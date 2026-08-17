@@ -29,6 +29,8 @@ pub use embedding_model::EmbeddingModel;
 #[cfg(feature = "embedding-model-request")]
 pub use embedding_model::EmbeddingModelRequest;
 
-pub use messages::{AssistantMessage, Message, Messages, Role, SystemMessage, UserMessage};
+pub use messages::{
+    AssistantMessage, MediaContent, Message, Messages, Role, SystemMessage, UserMessage,
+};
 pub use provider::Provider;
 pub use tools::{Tool, ToolCallInfo, ToolContext, ToolResultInfo};

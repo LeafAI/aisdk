@@ -381,6 +381,11 @@ pub(crate) enum MessageItem {
 pub(crate) enum FunctionCallOutput {
     Text(String),
     Other(ContentType),
+    /// A list of content items -- used when a tool result carries an image
+    /// alongside its text output (the Responses API accepts an array of
+    /// `input_text`/`input_image` items here, mirroring a user message's
+    /// `content` shape).
+    List(Vec<ContentType>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

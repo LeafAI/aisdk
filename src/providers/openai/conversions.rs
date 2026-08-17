@@ -86,21 +86,39 @@ impl From<LanguageModelOptions> for client::OpenAILanguageModelOptions {
 impl From<Message> for Option<types::InputItem> {
     fn from(m: Message) -> Self {
         match m {
-            Message::Tool(ref tool_info) => Some(types::InputItem::Item(
-                types::MessageItem::FunctionCallOutput {
-                    id: None,
-                    type_: "function_call_output".to_string(),
-                    status: None,
-                    call_id: tool_info.tool.id.clone(),
-                    output: types::FunctionCallOutput::Text(
-                        tool_info
-                            .output
-                            .clone()
-                            .unwrap_or_else(|e| Value::String(e.to_string()))
-                            .to_string(),
-                    ),
-                },
-            )),
+            Message::Tool(ref tool_info) => {
+                let text = tool_info
+                    .output
+                    .clone()
+                    .unwrap_or_else(|e| Value::String(e.to_string()))
+                    .to_string();
+                let image_items: Vec<types::ContentType> = tool_info
+                    .media
+                    .iter()
+                    .filter(|m| m.is_image())
+                    .map(|m| types::ContentType::InputImage {
+                        detail: types::ImageDetail::default(),
+                        file_id: None,
+                        image_url: Some(format!("data:{};base64,{}", m.mime_type, m.data)),
+                    })
+                    .collect();
+                let output = if image_items.is_empty() {
+                    types::FunctionCallOutput::Text(text)
+                } else {
+                    let mut items = vec![types::ContentType::InputText { text }];
+                    items.extend(image_items);
+                    types::FunctionCallOutput::List(items)
+                };
+                Some(types::InputItem::Item(
+                    types::MessageItem::FunctionCallOutput {
+                        id: None,
+                        type_: "function_call_output".to_string(),
+                        status: None,
+                        call_id: tool_info.tool.id.clone(),
+                        output,
+                    },
+                ))
+            }
             Message::Assistant(ref assistant_msg) => match assistant_msg.content {
                 LanguageModelResponseContentType::Text(ref msg) => {
                     Some(types::InputItem::Item(types::MessageItem::OutputMessage {
@@ -140,11 +158,30 @@ impl From<Message> for Option<types::InputItem> {
                 }
                 _ => None,
             },
-            Message::User(u) => Some(types::InputItem::Item(types::MessageItem::InputMessage {
-                content: vec![types::ContentType::InputText { text: u.content }],
-                role: types::Role::User,
-                type_: "message".to_string(),
-            })),
+            Message::User(u) => {
+                // The Responses API's `input_image` block takes a single
+                // `image_url`, which for inline (non-hosted) images is a
+                // `data:<mime>;base64,<data>` URI rather than a separate
+                // base64 field -- unlike Anthropic's `source.data`/
+                // `source.media_type` split. Images are emitted before the
+                // text block, matching the ordering used for Anthropic.
+                let mut content: Vec<types::ContentType> = u
+                    .media
+                    .iter()
+                    .filter(|m| m.is_image())
+                    .map(|m| types::ContentType::InputImage {
+                        detail: types::ImageDetail::default(),
+                        file_id: None,
+                        image_url: Some(format!("data:{};base64,{}", m.mime_type, m.data)),
+                    })
+                    .collect();
+                content.push(types::ContentType::InputText { text: u.content });
+                Some(types::InputItem::Item(types::MessageItem::InputMessage {
+                    content,
+                    role: types::Role::User,
+                    type_: "message".to_string(),
+                }))
+            }
             Message::System(s) => Some(types::InputItem::Item(types::MessageItem::InputMessage {
                 content: vec![types::ContentType::InputText { text: s.content }],
                 role: types::Role::System,
@@ -292,6 +329,86 @@ mod tests {
                 );
             }
             _ => panic!("expected second item to be a user input message"),
+        }
+    }
+
+    #[test]
+    fn test_user_message_with_image_media_emits_input_image_then_input_text() {
+        use crate::core::messages::{MediaContent, UserMessage};
+        let options = LanguageModelOptions {
+            messages: vec![
+                Message::User(UserMessage::with_media(
+                    "what is this?",
+                    vec![MediaContent::new("aGVsbG8=", "image/png")],
+                ))
+                .into(),
+            ],
+            ..Default::default()
+        };
+
+        let req: OpenAILanguageModelOptions = options.into();
+        let input = req.input.expect("input should be present");
+        let Input::InputItemList(items) = input else {
+            panic!("expected input item list")
+        };
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            InputItem::Item(MessageItem::InputMessage { role, content, .. }) => {
+                assert_eq!(role, &Role::User);
+                assert_eq!(content.len(), 2, "image part + text part");
+                match &content[0] {
+                    ContentType::InputImage { image_url, .. } => {
+                        assert_eq!(image_url.as_deref(), Some("data:image/png;base64,aGVsbG8="));
+                    }
+                    other => panic!("expected InputImage first, got: {other:?}"),
+                }
+                assert!(
+                    matches!(&content[1], ContentType::InputText { text } if text == "what is this?")
+                );
+            }
+            _ => panic!("expected user input message"),
+        }
+    }
+
+    #[test]
+    fn test_tool_result_with_image_media_emits_list_output() {
+        use crate::core::messages::MediaContent;
+        use crate::core::tools::{ToolDetails, ToolResultInfo};
+        let mut result = ToolResultInfo::new("media_read");
+        result.tool = ToolDetails {
+            name: "media_read".to_string(),
+            id: "call-1".to_string(),
+        };
+        result.output = Ok(json!({"path": "photo.png"}));
+        result.media = vec![MediaContent::new("aW1hZ2U=", "image/jpeg")];
+
+        let options = LanguageModelOptions {
+            messages: vec![Message::Tool(result).into()],
+            ..Default::default()
+        };
+        let req: OpenAILanguageModelOptions = options.into();
+        let input = req.input.expect("input should be present");
+        let Input::InputItemList(items) = input else {
+            panic!("expected input item list")
+        };
+        match &items[0] {
+            InputItem::Item(MessageItem::FunctionCallOutput { output, .. }) => match output {
+                FunctionCallOutput::List(parts) => {
+                    assert_eq!(parts.len(), 2, "text part + image part");
+                    assert!(matches!(&parts[0], ContentType::InputText { .. }));
+                    match &parts[1] {
+                        ContentType::InputImage { image_url, .. } => {
+                            assert_eq!(
+                                image_url.as_deref(),
+                                Some("data:image/jpeg;base64,aW1hZ2U=")
+                            );
+                        }
+                        other => panic!("expected InputImage, got: {other:?}"),
+                    }
+                }
+                other => panic!("expected FunctionCallOutput::List, got: {other:?}"),
+            },
+            _ => panic!("expected FunctionCallOutput item"),
         }
     }
 

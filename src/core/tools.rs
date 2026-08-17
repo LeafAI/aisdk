@@ -380,6 +380,13 @@ pub struct ToolResultInfo {
 
     /// The output of the tool.
     pub output: Result<serde_json::Value>,
+
+    /// Media attachments (images, etc.) carried alongside `output` --  a
+    /// vision-capable tool (e.g. a media-reading tool) sets this so the
+    /// result renders as a native image content block in the `tool_result`
+    /// sent back to the model, instead of only a JSON description of the
+    /// file. Empty for a plain-data result -- the common case.
+    pub media: Vec<crate::core::messages::MediaContent>,
 }
 
 impl Default for ToolResultInfo {
@@ -387,6 +394,7 @@ impl Default for ToolResultInfo {
         Self {
             tool: ToolDetails::default(),
             output: Ok(serde_json::Value::Null),
+            media: Vec::new(),
         }
     }
 }
@@ -416,6 +424,11 @@ impl ToolResultInfo {
     /// Sets the output of the tool.
     pub fn output(&mut self, inp: serde_json::Value) {
         self.output = Ok(inp);
+    }
+
+    /// Attaches media (e.g. an image) to the tool result.
+    pub fn media(&mut self, media: Vec<crate::core::messages::MediaContent>) {
+        self.media = media;
     }
 }
 
