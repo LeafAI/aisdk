@@ -573,7 +573,21 @@ pub enum LanguageModelStreamChunkType {
     // NOTE: This event is emitted by the sdk after the tool call is done
     ToolCallEnd(ToolResultInfo),
     /// Generation failed with an error message.
-    Failed(String),
+    ///
+    /// `status_code` carries the HTTP status when the failure came from an
+    /// HTTP-level rejection (an [`Error::ApiError`], e.g. a mid-stream 400
+    /// or 503 from the provider's SSE endpoint), and is `None` for
+    /// failures with no HTTP status (transport errors, content filters,
+    /// protocol violations). Without it, a consumer can only re-parse the
+    /// human-readable message to tell a retryable transient rejection from
+    /// a permanent one -- the status is known here, so it is carried
+    /// through rather than discarded.
+    Failed {
+        /// Human-readable failure message.
+        message: String,
+        /// HTTP status code, when the failure was an HTTP-level rejection.
+        status_code: Option<reqwest::StatusCode>,
+    },
     /// Generation ended with an incomplete response.
     Incomplete(String),
     /// Feature not supported by the provider.
@@ -587,6 +601,44 @@ impl LanguageModelStreamChunkType {
     #[must_use]
     pub fn is_tool_call_start(&self) -> bool {
         matches!(self, Self::ToolCallStart(..))
+    }
+
+    /// Builds a [`Failed`](Self::Failed) chunk carrying no HTTP status --
+    /// for failures that aren't HTTP-level rejections (transport errors,
+    /// content filters, protocol violations).
+    #[must_use]
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self::Failed {
+            message: message.into(),
+            status_code: None,
+        }
+    }
+
+    /// Builds a [`Failed`](Self::Failed) chunk from an [`Error`], carrying
+    /// the HTTP status when the error is an [`Error::ApiError`] so
+    /// consumers can classify a transient rejection (retryable) apart from
+    /// a permanent one without re-parsing the message.
+    #[must_use]
+    pub fn failed_from_error(error: &Error) -> Self {
+        let status_code = match error {
+            Error::ApiError { status_code, .. } => *status_code,
+            _ => None,
+        };
+        Self::Failed {
+            message: error.to_string(),
+            status_code,
+        }
+    }
+
+    /// The HTTP status of a [`Failed`](Self::Failed) chunk, when it came
+    /// from an HTTP-level rejection. `None` for every other chunk type and
+    /// for failures with no status.
+    #[must_use]
+    pub fn failure_status(&self) -> Option<reqwest::StatusCode> {
+        match self {
+            Self::Failed { status_code, .. } => *status_code,
+            _ => None,
+        }
     }
 }
 

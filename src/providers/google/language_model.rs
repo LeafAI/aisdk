@@ -195,7 +195,7 @@ impl<M: ModelName> LanguageModel for Google<M> {
                                         | FinishReason::Spii
                                         | FinishReason::MalformedFunctionCall => {
                                             Some(LanguageModelStreamChunk::Delta(
-                                                LanguageModelStreamChunkType::Failed(format!(
+                                                LanguageModelStreamChunkType::failed(format!(
                                                     "{finish_reason:?}"
                                                 )),
                                             ))

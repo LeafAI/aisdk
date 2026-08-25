@@ -228,7 +228,7 @@ impl<M: ModelName> LanguageModel for OpenAI<M> {
             Ok(client::OpenAiStreamEvent::ResponseError { code, message, .. }) => {
                 let reason = format!("{}: {}", code.unwrap_or("unknown".to_string()), message);
                 Ok(vec![LanguageModelStreamChunk::Delta(
-                    LanguageModelStreamChunkType::Failed(reason),
+                    LanguageModelStreamChunkType::failed(reason),
                 )])
             }
 

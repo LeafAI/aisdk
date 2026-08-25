@@ -339,9 +339,7 @@ impl<M: ModelName> LanguageModel for OpenAIChatCompletions<M> {
                                     usage,
                                 }));
                                 results.push(LanguageModelStreamChunk::Delta(
-                                    LanguageModelStreamChunkType::Failed(
-                                        "Content filtered".to_string(),
-                                    ),
+                                    LanguageModelStreamChunkType::failed("Content filtered"),
                                 ));
                             }
                             // For any unknown finish reason emit NotSupported then close cleanly
@@ -404,7 +402,7 @@ impl<M: ModelName> LanguageModel for OpenAIChatCompletions<M> {
             }
             Ok(types::ChatCompletionsStreamEvent::Error(e)) => {
                 Ok(vec![LanguageModelStreamChunk::Delta(
-                    LanguageModelStreamChunkType::Failed(e),
+                    LanguageModelStreamChunkType::failed(e),
                 )])
             }
             Err(e) => {

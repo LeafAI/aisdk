@@ -249,7 +249,7 @@ impl<M: ModelName> LanguageModel for Anthropic<M> {
                                     Some(AccumulatedBlock::Thinking { .. }) => Some(Ok(vec![LanguageModelStreamChunk::Delta(LanguageModelStreamChunkType::ReasoningEnd)])),
                                     Some(AccumulatedBlock::RedactedThinking(_)) => Some(Ok(vec![LanguageModelStreamChunk::Delta(LanguageModelStreamChunkType::NotSupported("RedactedThinking".to_string()))])),
                                     Some(AccumulatedBlock::ToolUse { .. }) => None,
-                                    None => Some(Ok(vec![LanguageModelStreamChunk::Delta(LanguageModelStreamChunkType::Failed("An end chunk returned for an improperly initialized stream".to_string()))])),
+                                    None => Some(Ok(vec![LanguageModelStreamChunk::Delta(LanguageModelStreamChunkType::failed("An end chunk returned for an improperly initialized stream"))])),
                                 }
                             }
                         AnthropicStreamEvent::MessageDelta { usage, .. } => {
@@ -329,7 +329,7 @@ impl<M: ModelName> LanguageModel for Anthropic<M> {
                             let reason = format!("{}: {}", error.type_, error.message);
 
                             Some(Ok(vec![LanguageModelStreamChunk::Delta(
-                                LanguageModelStreamChunkType::Failed(reason),
+                                LanguageModelStreamChunkType::failed(reason),
                             )]))
                         }
                         AnthropicStreamEvent::NotSupported(txt) => {

@@ -106,9 +106,7 @@ impl<M: LanguageModel> LanguageModelRequest<M> {
                     Ok(r) => r,
                     Err(e) => {
                         options.stop_reason = Some(StopReason::Error(e.clone()));
-                        let _ = tx.send(LanguageModelStreamChunkType::Failed(format!(
-                            "Model streaming failed: {e}"
-                        )));
+                        let _ = tx.send(LanguageModelStreamChunkType::failed_from_error(&e));
                         return Err(e);
                     }
                 };
@@ -223,7 +221,7 @@ impl<M: LanguageModel> LanguageModelRequest<M> {
                             }
                         }
                         Err(e) => {
-                            let _ = tx.send(LanguageModelStreamChunkType::Failed(e.to_string()));
+                            let _ = tx.send(LanguageModelStreamChunkType::failed_from_error(e));
                             options.stop_reason = Some(StopReason::Error(e.clone()));
                             break;
                         }

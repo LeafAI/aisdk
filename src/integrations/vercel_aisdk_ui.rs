@@ -483,7 +483,7 @@ fn map_language_model_chunk_to_vercel_ui(
             vec![output_chunk]
         }
 
-        LanguageModelStreamChunkType::Failed(error)
+        LanguageModelStreamChunkType::Failed { message: error, .. }
         | LanguageModelStreamChunkType::Incomplete(error)
         | LanguageModelStreamChunkType::NotSupported(error) => {
             vec![VercelUIStream::Error { error_text: error }]
