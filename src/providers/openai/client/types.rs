@@ -85,27 +85,31 @@ pub(crate) enum OpenAiStreamEvent {
     /// Emitted when the model response is complete.
     #[serde(rename = "response.completed")]
     ResponseCompleted {
-        sequence_number: u64,
+        #[serde(default)]
+        sequence_number: Option<u64>,
         response: OpenAIResponse,
     },
     /// Emitted when an output item is added to the response.
     #[serde(rename = "response.output_item.added")]
     ResponseOutputItemAdded {
-        sequence_number: u64,
+        #[serde(default)]
+        sequence_number: Option<u64>,
         output_index: u32,
         item: MessageItem,
     },
     /// Emitted when an output item is finalized.
     #[serde(rename = "response.output_item.done")]
     ResponseOutputItemDone {
-        sequence_number: u64,
+        #[serde(default)]
+        sequence_number: Option<u64>,
         output_index: u32,
         item: MessageItem,
     },
     /// Emitted when function-call arguments stream a delta.
     #[serde(rename = "response.function_call_arguments.delta")]
     ResponseFunctionCallArgumentsDelta {
-        sequence_number: u64,
+        #[serde(default)]
+        sequence_number: Option<u64>,
         item_id: String,
         output_index: u32,
         delta: String,
@@ -113,7 +117,8 @@ pub(crate) enum OpenAiStreamEvent {
     /// Emitted when function-call arguments streaming is complete.
     #[serde(rename = "response.function_call_arguments.done")]
     ResponseFunctionCallArgumentsDone {
-        sequence_number: u64,
+        #[serde(default)]
+        sequence_number: Option<u64>,
         item_id: String,
         output_index: u32,
         arguments: String,
@@ -121,13 +126,15 @@ pub(crate) enum OpenAiStreamEvent {
     /// An event that is emitted when a response finishes as incomplete.
     #[serde(rename = "response.incomplete")]
     ResponseIncomplete {
-        sequence_number: u64,
+        #[serde(default)]
+        sequence_number: Option<u64>,
         response: OpenAIResponse,
     },
     /// Emitted when there is an additional text delta.
     #[serde(rename = "response.output_text.delta")]
     ResponseOutputTextDelta {
-        sequence_number: u64,
+        #[serde(default)]
+        sequence_number: Option<u64>,
         item_id: String,
         output_index: u32,
         content_index: u32,
@@ -138,7 +145,8 @@ pub(crate) enum OpenAiStreamEvent {
     /// Emitted when a text delta is done.
     #[serde(rename = "response.output_text.done")]
     ResponseOutputTextDone {
-        sequence_number: u64,
+        #[serde(default)]
+        sequence_number: Option<u64>,
         item_id: String,
         output_index: u32,
         content_index: u32,
@@ -149,7 +157,8 @@ pub(crate) enum OpenAiStreamEvent {
     /// Emitted when a delta is added to a reasoning summary text.
     #[serde(rename = "response.reasoning_summary_text.delta")]
     ResponseReasoningSummaryTextDelta {
-        sequence_number: u64,
+        #[serde(default)]
+        sequence_number: Option<u64>,
         item_id: String,
         output_index: u32,
         summary_index: u32,
@@ -159,7 +168,8 @@ pub(crate) enum OpenAiStreamEvent {
     /// Emitted when a reasoning summary text is done.
     #[serde(rename = "response.reasoning_summary_text.done")]
     ResponseReasoningSummaryTextDone {
-        sequence_number: u64,
+        #[serde(default)]
+        sequence_number: Option<u64>,
         item_id: String,
         output_index: u32,
         summary_index: u32,
@@ -169,7 +179,8 @@ pub(crate) enum OpenAiStreamEvent {
     /// Emitted when an error occurs.
     #[serde(rename = "error")]
     ResponseError {
-        sequence_number: u64,
+        #[serde(default)]
+        sequence_number: Option<u64>,
         code: Option<String>,
         message: String,
         param: Option<String>,
@@ -519,4 +530,106 @@ pub(crate) struct OpenAIEmbeddingOptions {
     #[serde(skip)]
     #[builder(default)]
     pub(crate) extra_headers: Option<std::collections::HashMap<String, String>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test: some OpenAI-Responses-API-compatible backends (e.g.
+    /// agnes, `https://api.agnes-ai.cn/v1`, observed during
+    /// `agent-injector`'s `crates/core/tests/agnes_live.rs`) omit the
+    /// `sequence_number` field on SSE stream events for some routed model
+    /// variants, even though it is present in OpenAI's own documented
+    /// schema. Before this field was made `Option<u64>` with
+    /// `#[serde(default)]`, such an event would fail to deserialize into any
+    /// `OpenAiStreamEvent` variant (a required-but-missing `u64` field is a
+    /// hard deserialization error, not a soft one) and silently fall back to
+    /// `OpenAiStreamEvent::NotSupported(raw_json)` at the call site
+    /// (`client/mod.rs`'s `parse_stream_sse`), which discards the entire
+    /// event including any text/tool-call content it carried. When every
+    /// event in a turn is affected this way, the caller sees "no text was
+    /// ever delivered" and reports the whole turn as failed, even though the
+    /// upstream response was semantically complete and well-formed.
+    #[test]
+    fn stream_event_deserializes_without_sequence_number() {
+        let missing_field_json = serde_json::json!({
+            "type": "response.output_text.delta",
+            "item_id": "item_1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "Hello",
+            "logprobs": null,
+        });
+
+        let event: OpenAiStreamEvent = serde_json::from_value(missing_field_json)
+            .expect("event must deserialize even when sequence_number is absent");
+
+        match event {
+            OpenAiStreamEvent::ResponseOutputTextDelta {
+                sequence_number,
+                delta,
+                ..
+            } => {
+                assert_eq!(sequence_number, None);
+                assert_eq!(delta, "Hello");
+            }
+            other => panic!("expected ResponseOutputTextDelta, got {other:?}"),
+        }
+    }
+
+    /// The common case (a well-formed, spec-compliant event carrying
+    /// `sequence_number`) must keep working identically after widening the
+    /// field to `Option<u64>`.
+    #[test]
+    fn stream_event_deserializes_with_sequence_number_present() {
+        let full_json = serde_json::json!({
+            "type": "response.output_text.delta",
+            "sequence_number": 7,
+            "item_id": "item_1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "Hello",
+            "logprobs": null,
+        });
+
+        let event: OpenAiStreamEvent = serde_json::from_value(full_json)
+            .expect("event must deserialize when sequence_number is present");
+
+        match event {
+            OpenAiStreamEvent::ResponseOutputTextDelta {
+                sequence_number, ..
+            } => {
+                assert_eq!(sequence_number, Some(7));
+            }
+            other => panic!("expected ResponseOutputTextDelta, got {other:?}"),
+        }
+    }
+
+    /// `response.completed` (the event `end_stream()` in `client/mod.rs`
+    /// checks for) must also tolerate a missing `sequence_number`, since a
+    /// turn that ends on exactly this event type is the case that most
+    /// directly determines whether the caller sees a successful completion
+    /// or a "stream ended" failure.
+    #[test]
+    fn response_completed_deserializes_without_sequence_number() {
+        let json = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "model": "agnes-2.0-flash",
+            },
+        });
+
+        let event: OpenAiStreamEvent = serde_json::from_value(json)
+            .expect("response.completed must deserialize even when sequence_number is absent");
+
+        assert!(matches!(
+            event,
+            OpenAiStreamEvent::ResponseCompleted {
+                sequence_number: None,
+                ..
+            }
+        ));
+    }
 }
