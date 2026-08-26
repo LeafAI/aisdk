@@ -101,37 +101,26 @@ impl<M: ModelName> LanguageModelClient for Google<M> {
         )
     }
 
-    fn parse_stream_sse(
-        event: std::result::Result<Event, reqwest_eventsource::Error>,
-    ) -> Result<Self::StreamEvent> {
+    fn parse_stream_sse(event: std::result::Result<Event, Error>) -> Result<Self::StreamEvent> {
         match event {
-            Ok(event) => match event {
-                Event::Open => Ok(types::GoogleStreamEvent::NotSupported("{}".to_string())),
-                Event::Message(msg) => {
-                    let value: serde_json::Value =
-                        serde_json::from_str(&msg.data).map_err(|e| Error::ApiError {
-                            status_code: None,
-                            details: format!("Invalid JSON in SSE data: {e}"),
-                        })?;
+            Ok(Event::Open) => Ok(types::GoogleStreamEvent::NotSupported("{}".to_string())),
+            Ok(Event::Message(msg)) => {
+                let value: serde_json::Value =
+                    serde_json::from_str(&msg.data).map_err(|e| Error::ApiError {
+                        status_code: None,
+                        details: format!("Invalid JSON in SSE data: {e}"),
+                    })?;
 
-                    Ok(
-                        serde_json::from_value::<types::GenerateContentResponse>(value)
-                            .map(types::GoogleStreamEvent::Response)
-                            .unwrap_or(types::GoogleStreamEvent::NotSupported(msg.data)),
-                    )
-                }
-            },
-            Err(e) => {
-                // Extract status code if it's an InvalidStatusCode error
-                let status_code = match &e {
-                    reqwest_eventsource::Error::InvalidStatusCode(status, _) => Some(*status),
-                    _ => None,
-                };
-                Err(Error::ApiError {
-                    status_code,
-                    details: e.to_string(),
-                })
+                Ok(
+                    serde_json::from_value::<types::GenerateContentResponse>(value)
+                        .map(types::GoogleStreamEvent::Response)
+                        .unwrap_or(types::GoogleStreamEvent::NotSupported(msg.data)),
+                )
             }
+            // Already a fully-formed `Error::ApiError` (with its response
+            // body, when the rejection carried one) by the time it reaches
+            // here -- see `convert_sse_error` in `core/client.rs`.
+            Err(e) => Err(e),
         }
     }
 

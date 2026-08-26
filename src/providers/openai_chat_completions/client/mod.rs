@@ -54,35 +54,27 @@ impl<M: ModelName> LanguageModelClient for OpenAIChatCompletions<M> {
     }
 
     fn parse_stream_sse(
-        event: std::result::Result<Event, reqwest_eventsource::Error>,
+        event: std::result::Result<Event, Error>,
     ) -> crate::error::Result<Self::StreamEvent> {
         match event {
-            Ok(event) => match event {
-                Event::Open => Ok(ChatCompletionsStreamEvent::Open),
-                Event::Message(msg) => {
-                    if msg.data.trim() == "[DONE]" || msg.data.is_empty() {
-                        return Ok(ChatCompletionsStreamEvent::Done);
-                    }
-
-                    let chunk: ChatCompletionsStreamChunk = serde_json::from_str(&msg.data)
-                        .map_err(|e| Error::ApiError {
-                            status_code: None,
-                            details: format!("Invalid JSON in SSE: {e}"),
-                        })?;
-
-                    Ok(ChatCompletionsStreamEvent::Chunk(chunk))
+            Ok(Event::Open) => Ok(ChatCompletionsStreamEvent::Open),
+            Ok(Event::Message(msg)) => {
+                if msg.data.trim() == "[DONE]" || msg.data.is_empty() {
+                    return Ok(ChatCompletionsStreamEvent::Done);
                 }
-            },
-            Err(e) => {
-                let status_code = match &e {
-                    reqwest_eventsource::Error::InvalidStatusCode(status, _) => Some(*status),
-                    _ => None,
-                };
-                Err(Error::ApiError {
-                    status_code,
-                    details: e.to_string(),
-                })
+
+                let chunk: ChatCompletionsStreamChunk =
+                    serde_json::from_str(&msg.data).map_err(|e| Error::ApiError {
+                        status_code: None,
+                        details: format!("Invalid JSON in SSE: {e}"),
+                    })?;
+
+                Ok(ChatCompletionsStreamEvent::Chunk(chunk))
             }
+            // Already a fully-formed `Error::ApiError` (with its response
+            // body, when the rejection carried one) by the time it reaches
+            // here -- see `convert_sse_error` in `core/client.rs`.
+            Err(e) => Err(e),
         }
     }
 

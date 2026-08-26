@@ -126,6 +126,54 @@ fn is_retryable_transport_error(err: &reqwest_eventsource::Error) -> bool {
     )
 }
 
+/// Converts a raw SSE event/error into the SDK's own `Result<Event, Error>`,
+/// reading and folding a rejection response's body into `Error::ApiError`'s
+/// `details` when one is available.
+///
+/// `InvalidStatusCode`/`InvalidContentType` are the only variants carrying a
+/// `Response` (and therefore a readable body) -- every other
+/// `reqwest_eventsource::Error` variant has no response to read, and maps
+/// straight through via `details: e.to_string()` exactly as each provider's
+/// own `parse_stream_sse` used to do inline. A body read that itself fails
+/// (a network drop mid-read, non-UTF8 bytes) degrades to the status-only
+/// message rather than losing the error entirely.
+async fn convert_sse_error(
+    event: std::result::Result<Event, reqwest_eventsource::Error>,
+) -> std::result::Result<Event, Error> {
+    match event {
+        Ok(event) => Ok(event),
+        Err(reqwest_eventsource::Error::InvalidStatusCode(status, response)) => {
+            let details = match response.text().await {
+                Ok(body) if !body.trim().is_empty() => {
+                    format!("Invalid status code: {status} - {body}")
+                }
+                _ => format!("Invalid status code: {status}"),
+            };
+            Err(Error::ApiError {
+                status_code: Some(status),
+                details,
+            })
+        }
+        Err(reqwest_eventsource::Error::InvalidContentType(header, response)) => {
+            let status = response.status();
+            let details = match response.text().await {
+                Ok(body) if !body.trim().is_empty() => {
+                    format!("Invalid header value: {header:?} - {body}")
+                }
+                _ => format!("Invalid header value: {header:?}"),
+            };
+            Err(Error::ApiError {
+                status_code: Some(status),
+                details,
+            })
+        }
+        Err(other) => Err(Error::ApiError {
+            status_code: None,
+            details: other.to_string(),
+        }),
+    }
+}
+
 /// Parses the Retry-After header to get the wait duration.
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     headers
@@ -384,10 +432,18 @@ pub(crate) trait LanguageModelClient {
         .await
     }
 
-    /// Parses an SSE event into a StreamEvent ( ProviderStreamEvent )
-    fn parse_stream_sse(
-        event: std::result::Result<Event, reqwest_eventsource::Error>,
-    ) -> Result<Self::StreamEvent>;
+    /// Parses an SSE event into a StreamEvent ( ProviderStreamEvent ).
+    ///
+    /// The error side is already the SDK's own [`Error`] rather than
+    /// [`reqwest_eventsource::Error`] directly: `send_and_stream` converts it
+    /// upstream of this call so an `InvalidStatusCode` rejection's response
+    /// body (the provider's actual JSON error -- rate limit reason, invalid
+    /// parameter, quota exceeded, ...) is read and folded into `details`
+    /// before this method ever runs. A provider only needs to pass a
+    /// non-`ApiError` variant straight through; for `ApiError` it may still
+    /// inspect/override `status_code` or `details` if it needs
+    /// provider-specific handling.
+    fn parse_stream_sse(event: std::result::Result<Event, Error>) -> Result<Self::StreamEvent>;
 
     /// Returns true to mark the stream as ended
     fn end_stream(event: &Self::StreamEvent) -> bool;
@@ -461,11 +517,24 @@ pub(crate) trait LanguageModelClient {
             None => raw_stream,
         };
 
-        // Map events to deserialized StreamEvent ( ProviderStreamEvent )
+        // Map events to deserialized StreamEvent ( ProviderStreamEvent ).
         // Filter out Event::Open (connection acknowledgement with no data) before parsing,
         // so providers never receive a spurious NotSupported chunk as the first stream item.
+        //
+        // `convert_sse_error` runs first (it's the only async step: reading a
+        // response body when present) so an `InvalidStatusCode` rejection's
+        // response -- which otherwise gets silently dropped, its `_` in every
+        // provider's own `match &e { InvalidStatusCode(status, _) => ... }` --
+        // has its body read and folded into the resulting `Error::ApiError`'s
+        // `details` before any provider's synchronous `parse_stream_sse` ever
+        // runs. Without this, every provider's status-code branch renders as a
+        // bare "Invalid status code: 400 Bad Request" with no indication of
+        // *why* -- the provider's actual JSON error body (rate limit reason,
+        // invalid parameter, quota exceeded, ...) was reachable on the
+        // `Response` this error carried, but nothing ever read it.
         let mapped_stream = events_stream
             .filter(|e| futures::future::ready(!matches!(e, Ok(Event::Open))))
+            .then(convert_sse_error)
             .map(|event_result| Self::parse_stream_sse(event_result));
 
         // State that indicates if the stream has ended
