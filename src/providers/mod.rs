@@ -1,6 +1,12 @@
 //! This module provides the `Provider` trait, which defines the interface for
 //! interacting with different AI providers.
 
+// Shared helpers for OpenAI-shaped providers (strict-mode schema fixups);
+// used by both the Responses API (`openai`) and Chat Completions API
+// (`openai_chat_completions`, and everything built on it).
+#[cfg(any(feature = "openai", feature = "openaichatcompletions"))]
+pub(crate) mod openai_shared;
+
 #[cfg(feature = "openai")]
 pub mod openai;
 #[cfg(feature = "openai")]

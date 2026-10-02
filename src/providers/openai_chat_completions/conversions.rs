@@ -376,6 +376,17 @@ impl From<SdkTool> for types::Tool {
             params["properties"] = serde_json::Value::Object(serde_json::Map::new());
         }
 
+        // OpenAI's strict mode (`strict: true`, set below) requires every
+        // key in `properties` to also appear in `required` -- a property
+        // the caller's schema didn't mark required is made "optional" by
+        // adding `null` to its own type instead. Without this, any tool
+        // schema with a genuinely optional field (anything using
+        // `#[serde(default)]`/`Option<T>` without `required` covering it)
+        // is rejected outright by OpenAI with HTTP 400
+        // `invalid_function_parameters`, before the tool is ever offered to
+        // the model.
+        crate::providers::openai_shared::make_strict_schema_required(&mut params);
+
         types::Tool {
             type_: "function".to_string(),
             function: types::FunctionDefinition {
@@ -616,6 +627,61 @@ mod tests {
             Some(types::ToolChoice::String(choice)) if choice == "auto"
         ));
         assert_eq!(completions_opts.parallel_tool_calls, Some(true));
+    }
+
+    /// Regression test: OpenAI's strict mode (set unconditionally above)
+    /// requires every key in `properties` to also be listed in `required`.
+    /// A tool schema with a genuinely optional field (here, `timeout_secs`,
+    /// not covered by `required` in the raw schemars output) used to be
+    /// sent as-is and rejected outright by OpenAI with HTTP 400
+    /// `invalid_function_parameters` -- verified via deliberate breakage of
+    /// `make_strict_schema_required` during development of this fix.
+    #[test]
+    fn test_strict_mode_requires_every_property_even_when_optional() {
+        #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+        struct ShellInput {
+            command: String,
+            #[serde(default)]
+            timeout_secs: Option<u32>,
+        }
+
+        let tool = Tool::builder()
+            .name("shell_exec")
+            .description("Runs a shell command")
+            .input_schema(schema_for!(ShellInput))
+            .execute(ToolExecute::from_sync(|_, _| Ok("ok".to_string())))
+            .build()
+            .expect("tool should build");
+
+        let options = LanguageModelOptions {
+            tools: Some(ToolList::new(vec![tool])),
+            ..Default::default()
+        };
+
+        let completions_opts: client::ChatCompletionsOptions = options.into();
+        let tools = completions_opts.tools.expect("tools should be present");
+        let params = &tools[0].function.parameters;
+
+        let required: Vec<&str> = params["required"]
+            .as_array()
+            .expect("required must be an array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            required.contains(&"command") && required.contains(&"timeout_secs"),
+            "every property key must be listed in required under strict mode, got: {required:?}"
+        );
+        // The genuinely-optional field is still representable as absent:
+        // OpenAI's strict mode expresses that via a nullable type instead
+        // of omitting it from `required`.
+        assert!(
+            params["properties"]["timeout_secs"]["type"]
+                .as_array()
+                .is_some_and(|types| types.iter().any(|t| t == "null")),
+            "optional field's type must include null: {:?}",
+            params["properties"]["timeout_secs"]
+        );
     }
 
     /// ReasonedResponse variant: one SDK message → one ChatMessage with

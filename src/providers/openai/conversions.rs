@@ -24,6 +24,12 @@ impl From<Tool> for types::ToolParams {
             params["properties"] = Value::Object(serde_json::Map::new());
         }
 
+        // Strict mode (`strict: true`, set below) requires every key in
+        // `properties` to also appear in `required` -- see
+        // `openai_shared::make_strict_schema_required`'s doc for why this
+        // is necessary and what it does to an otherwise-optional field.
+        crate::providers::openai_shared::make_strict_schema_required(&mut params);
+
         types::ToolParams::Function {
             name: value.name,
             description: Some(value.description),
@@ -472,6 +478,60 @@ mod tests {
                 assert_eq!(parameters["additionalProperties"], json!(false));
                 assert!(parameters["properties"].get("a").is_some());
                 assert!(parameters["properties"].get("b").is_some());
+            }
+        }
+    }
+
+    /// Regression test: OpenAI's strict mode (set unconditionally above)
+    /// requires every key in `properties` to also be listed in `required`.
+    /// A tool schema with a genuinely optional field used to be sent as-is
+    /// and rejected outright by OpenAI with HTTP 400
+    /// `invalid_function_parameters`.
+    #[test]
+    fn test_strict_mode_requires_every_property_even_when_optional() {
+        #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+        struct AgentInput {
+            agent: String,
+            #[serde(default)]
+            timeout_secs: Option<u32>,
+        }
+
+        let tool = Tool::builder()
+            .name("agent")
+            .description("Switch active agent")
+            .input_schema(schema_for!(AgentInput))
+            .execute(ToolExecute::from_sync(|_, _| Ok("ok".to_string())))
+            .build()
+            .expect("tool should build");
+
+        let options = LanguageModelOptions {
+            tools: Some(ToolList::new(vec![tool])),
+            ..Default::default()
+        };
+
+        let req: OpenAILanguageModelOptions = options.into();
+        let tools = req.tools.expect("tools should be present");
+
+        match &tools[0] {
+            ToolParams::Function { parameters, .. } => {
+                let required: Vec<&str> = parameters["required"]
+                    .as_array()
+                    .expect("required must be an array")
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .collect();
+                assert!(
+                    required.contains(&"agent") && required.contains(&"timeout_secs"),
+                    "every property key must be listed in required under strict mode, \
+                     got: {required:?}"
+                );
+                assert!(
+                    parameters["properties"]["timeout_secs"]["type"]
+                        .as_array()
+                        .is_some_and(|types| types.iter().any(|t| t == "null")),
+                    "optional field's type must include null: {:?}",
+                    parameters["properties"]["timeout_secs"]
+                );
             }
         }
     }

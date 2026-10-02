@@ -17,6 +17,10 @@ Changelog entries are grouped by type, with the following types:
 
 ## [Unreleased] - ReleaseDate
 
+### Fixed
+
+- Fixed `openai` and `openai_chat_completions` (and every provider built on it) sending tool schemas that violate OpenAI's strict-mode requirement that every key in `properties` also appear in `required`. A tool with a genuinely optional parameter (anything using `#[serde(default)]`/`Option<T>` not already covered by `required`) was previously rejected outright by OpenAI with HTTP 400 `invalid_function_parameters` before the tool was ever offered to the model. Optional fields are now expressed as nullable (`type` gains `"null"`) and listed in `required`, matching OpenAI's documented structured-outputs contract.
+
 ### Added
 
 - Added support for SubAgents
