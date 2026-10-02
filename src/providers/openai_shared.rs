@@ -2,36 +2,48 @@
 //! Chat Completions API, plus every `openai_chat_completions`-based
 //! compatible provider).
 //!
-//! Both APIs' "strict" structured-output/tool-calling mode requires every
-//! key present in a schema's `properties` object to also be listed in its
-//! `required` array -- a property that is semantically optional is instead
-//! expressed by adding `"null"` to its own `type` (see
-//! <https://platform.openai.com/docs/guides/structured-outputs#all-fields-must-be-required>).
-//! A caller's `schemars`-derived schema routinely violates this: a field
-//! behind `#[serde(default)]`/`Option<T>` is typically *not* listed in
-//! `required`, which OpenAI rejects outright with HTTP 400
-//! `invalid_function_parameters` before the tool is ever offered to the
-//! model -- the caller never even gets a chance to decide whether the field
-//! was actually supplied.
+//! Both APIs' "strict" structured-output/tool-calling mode imposes two
+//! requirements on every object-shaped (sub-)schema, not just the
+//! top-level one:
+//!
+//! 1. Every key present in `properties` must also be listed in `required`
+//!    -- a property that is semantically optional is instead expressed by
+//!    adding `"null"` to its own `type` (see
+//!    <https://platform.openai.com/docs/guides/structured-outputs#all-fields-must-be-required>).
+//! 2. `additionalProperties` must be present and `false`.
+//!
+//! A caller's `schemars`-derived schema routinely violates both at nested
+//! levels: a field behind `#[serde(default)]`/`Option<T>` is typically not
+//! listed in `required`, and only the top-level object schema -- not array
+//! item schemas or nested object schemas -- gets `additionalProperties:
+//! false` set by callers that only patch the top level. OpenAI rejects the
+//! request outright with HTTP 400 `invalid_function_parameters` (for
+//! either violation, at any nesting depth) before the tool is ever offered
+//! to the model -- the caller never even gets a chance to decide whether a
+//! field was actually supplied, or to control the shape of an array
+//! element.
 
 use serde_json::Value;
 
-/// Rewrites `schema` in place so every property key is listed in
-/// `required`, nullifying the type of any property that wasn't already
-/// required (preserving optionality from the model's perspective: it may
-/// still omit the field by returning `null` for it). Recurses into nested
-/// object schemas under `properties` and into `items` for array schemas,
-/// since OpenAI's strict mode enforces this invariant at every nesting
-/// level, not just the top one.
+/// Rewrites `schema` in place so every object-shaped (sub-)schema -- the
+/// top level, every nested object under `properties`, and every array's
+/// `items` schema -- satisfies both of OpenAI strict mode's requirements:
+/// `required` lists every property key (with non-required ones nullified
+/// in their own `type`, preserving optionality from the model's
+/// perspective), and `additionalProperties` is `false`.
 ///
 /// No-op for a non-object `schema` value, or one with no `properties`
-/// object -- nothing to make required.
+/// object -- nothing to make required, though `additionalProperties` is
+/// still not touched in that case either since there is no properties
+/// shape to constrain.
 pub(crate) fn make_strict_schema_required(schema: &mut Value) {
     let Value::Object(obj) = schema else { return };
 
     let Some(Value::Object(properties)) = obj.get("properties").cloned() else {
         return;
     };
+
+    obj.insert("additionalProperties".to_string(), Value::Bool(false));
 
     let already_required: Vec<String> = obj
         .get("required")
@@ -53,7 +65,8 @@ pub(crate) fn make_strict_schema_required(schema: &mut Value) {
         }
         // Recurse into nested object/array schemas regardless of whether
         // this property itself was already required -- a nested object can
-        // have its own optional sub-fields independent of whether the
+        // have its own optional sub-fields (and its own
+        // `additionalProperties` requirement) independent of whether the
         // parent object field itself is required.
         make_strict_schema_required(&mut value);
         if let Some(items) = value.get_mut("items") {
@@ -194,6 +207,41 @@ mod tests {
         assert_eq!(
             schema["properties"]["findings"]["items"]["properties"]["verdict"]["type"],
             json!(["string", "null"])
+        );
+    }
+
+    /// Regression test reproducing the exact failure shape reported by a
+    /// real OpenAI-shaped provider against drift's `report_findings` tool:
+    /// `In context=('properties', 'findings', 'items'),
+    /// 'additionalProperties' is required to be supplied and to be false.`
+    /// Only the top-level schema's `additionalProperties` was being set;
+    /// nested object schemas (an array's `items`, here) were left without
+    /// one at all.
+    #[test]
+    fn sets_additional_properties_false_on_every_nested_object_schema_too() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "findings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "file": { "type": "string" },
+                            "summary": { "type": "string" }
+                        },
+                        "required": ["file", "summary"]
+                    }
+                }
+            },
+            "required": ["findings"]
+        });
+        make_strict_schema_required(&mut schema);
+        assert_eq!(schema["additionalProperties"], json!(false));
+        assert_eq!(
+            schema["properties"]["findings"]["items"]["additionalProperties"],
+            json!(false),
+            "nested object schema (array items) must also get additionalProperties: false"
         );
     }
 

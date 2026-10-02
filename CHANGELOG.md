@@ -20,6 +20,7 @@ Changelog entries are grouped by type, with the following types:
 ### Fixed
 
 - Fixed `openai` and `openai_chat_completions` (and every provider built on it) sending tool schemas that violate OpenAI's strict-mode requirement that every key in `properties` also appear in `required`. A tool with a genuinely optional parameter (anything using `#[serde(default)]`/`Option<T>` not already covered by `required`) was previously rejected outright by OpenAI with HTTP 400 `invalid_function_parameters` before the tool was ever offered to the model. Optional fields are now expressed as nullable (`type` gains `"null"`) and listed in `required`, matching OpenAI's documented structured-outputs contract.
+- Fixed the same strict-mode schema fixup only ever being applied to a tool's top-level schema: nested object schemas (e.g. an array parameter's `items` schema) were left without `additionalProperties: false` and without their own properties fully listed in `required`, which OpenAI also rejects with HTTP 400 `invalid_function_parameters` at that nesting level. The fixup now recurses into every nested object/array schema, not just the top one.
 
 ### Added
 
