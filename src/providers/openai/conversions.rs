@@ -12,29 +12,22 @@ use serde_json::Value;
 
 impl From<Tool> for types::ToolParams {
     fn from(value: Tool) -> Self {
-        let mut params = value.input_schema.to_value();
+        let params = value.input_schema.to_value();
 
-        // open ai requires 'additionalProperties' to be false
-        params["additionalProperties"] = Value::Bool(false);
-
-        // open ai requires 'properties' to be an object
-        let properties = params.get("properties");
-        if let Some(Value::Object(_)) = properties {
-        } else {
-            params["properties"] = Value::Object(serde_json::Map::new());
-        }
-
-        // Strict mode (`strict: true`, set below) requires every key in
-        // `properties` to also appear in `required` -- see
-        // `openai_shared::make_strict_schema_required`'s doc for why this
-        // is necessary and what it does to an otherwise-optional field.
-        crate::providers::openai_shared::make_strict_schema_required(&mut params);
+        // Normalizes the top-level schema shape and, when possible,
+        // rewrites it to satisfy OpenAI's strict mode -- see
+        // `openai_shared::prepare_openai_tool_schema`'s doc for the full
+        // pipeline and why a genuinely free-form object parameter (e.g. an
+        // MCP tool's passthrough `args`) falls back to `strict: false`
+        // instead of being sent a schema OpenAI would reject outright.
+        let (parameters, strict) =
+            crate::providers::openai_shared::prepare_openai_tool_schema(params);
 
         types::ToolParams::Function {
             name: value.name,
             description: Some(value.description),
-            strict: true,
-            parameters: params,
+            strict,
+            parameters,
         }
     }
 }

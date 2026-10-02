@@ -364,28 +364,18 @@ impl From<SdkTool> for types::Tool {
             obj.remove("title");
         }
 
-        // Ensure required fields for OpenAI Chat Completions
-        params["type"] = serde_json::Value::String("object".to_string());
-        params["additionalProperties"] = serde_json::Value::Bool(false);
-
-        if !params
-            .get("properties")
-            .map(|p| p.is_object())
-            .unwrap_or(false)
-        {
-            params["properties"] = serde_json::Value::Object(serde_json::Map::new());
-        }
-
-        // OpenAI's strict mode (`strict: true`, set below) requires every
-        // key in `properties` to also appear in `required` -- a property
-        // the caller's schema didn't mark required is made "optional" by
-        // adding `null` to its own type instead. Without this, any tool
-        // schema with a genuinely optional field (anything using
-        // `#[serde(default)]`/`Option<T>` without `required` covering it)
-        // is rejected outright by OpenAI with HTTP 400
-        // `invalid_function_parameters`, before the tool is ever offered to
-        // the model.
-        crate::providers::openai_shared::make_strict_schema_required(&mut params);
+        // Normalizes the top-level schema shape (type/properties) and, when
+        // possible, rewrites it to satisfy OpenAI's strict mode (every
+        // `properties` key listed in `required`, `additionalProperties:
+        // false` at every nesting level). A schema containing a genuinely
+        // free-form object parameter (no declared `properties` of its own,
+        // e.g. an MCP tool's passthrough `args`) can't be expressed under
+        // strict mode at all -- forcing `additionalProperties: false`
+        // there would reject every key the caller could ever send -- so
+        // such a tool falls back to strict: false instead of being sent a
+        // broken schema that OpenAI would reject outright with HTTP 400
+        // `invalid_function_parameters`.
+        let (params, strict) = crate::providers::openai_shared::prepare_openai_tool_schema(params);
 
         types::Tool {
             type_: "function".to_string(),
@@ -393,7 +383,7 @@ impl From<SdkTool> for types::Tool {
                 name: tool.name,
                 description: Some(tool.description),
                 parameters: params,
-                strict: Some(true),
+                strict: Some(strict),
             },
         }
     }
@@ -423,7 +413,7 @@ impl From<types::Usage> for Usage {
 mod tests {
     use super::*;
     use crate::core::tools::{Tool, ToolExecute, ToolList, ToolResultInfo};
-    use schemars::{JsonSchema, schema_for};
+    use schemars::{JsonSchema, Schema, schema_for};
     use serde::{Deserialize, Serialize};
     use serde_json::json;
 
@@ -681,6 +671,65 @@ mod tests {
                 .is_some_and(|types| types.iter().any(|t| t == "null")),
             "optional field's type must include null: {:?}",
             params["properties"]["timeout_secs"]
+        );
+    }
+
+    /// Regression test reproducing the exact failure shape reported by a
+    /// real OpenAI-shaped provider against an MCP bridge tool
+    /// (`execute_tool`, whose `args` parameter is a genuinely free-form
+    /// passthrough object with no declared `properties` of its own): such
+    /// a tool can never satisfy strict mode's `additionalProperties:
+    /// false` requirement (it would reject every key the caller could ever
+    /// send), so it must fall back to `strict: false` rather than being
+    /// sent a schema OpenAI rejects outright with HTTP 400
+    /// `invalid_function_parameters`.
+    #[test]
+    fn test_a_free_form_object_parameter_falls_back_to_non_strict_mode() {
+        // Hand-built rather than schemars-derived: this is the exact shape
+        // drift's own `execute_tool` MCP bridge tool declares for its
+        // genuinely free-form `args` passthrough parameter (`{"type":
+        // "object"}` with no properties of its own).
+        let input_schema: Schema = serde_json::from_value(json!({
+            "type": "object",
+            "properties": {
+                "server": { "type": "string" },
+                "tool": { "type": "string" },
+                "args": { "type": "object", "description": "Arguments to pass to the tool" }
+            },
+            "required": ["server", "tool"]
+        }))
+        .expect("schema should parse");
+
+        let tool = Tool::builder()
+            .name("execute_tool")
+            .description("Execute a tool on a specific MCP server")
+            .input_schema(input_schema)
+            .execute(ToolExecute::from_sync(|_, _| Ok("ok".to_string())))
+            .build()
+            .expect("tool should build");
+
+        let options = LanguageModelOptions {
+            tools: Some(ToolList::new(vec![tool])),
+            ..Default::default()
+        };
+
+        let completions_opts: client::ChatCompletionsOptions = options.into();
+        let tools = completions_opts.tools.expect("tools should be present");
+        let function = &tools[0].function;
+
+        assert_eq!(
+            function.strict,
+            Some(false),
+            "a schema with a free-form object property cannot satisfy strict mode"
+        );
+        // The schema itself is still a usable (non-strict) function schema:
+        // basic shape normalization (type/properties) still applies, the
+        // free-form property is left exactly as declared rather than being
+        // corrupted by a partial strict-mode rewrite.
+        assert_eq!(function.parameters["type"], json!("object"));
+        assert_eq!(
+            function.parameters["properties"]["args"],
+            json!({ "type": "object", "description": "Arguments to pass to the tool" }),
         );
     }
 

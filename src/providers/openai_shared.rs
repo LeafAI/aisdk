@@ -80,6 +80,111 @@ pub(crate) fn make_strict_schema_required(schema: &mut Value) {
     obj.insert("required".to_string(), Value::Array(required));
 }
 
+/// Returns whether `schema` -- and, recursively, every nested object/array
+/// schema it contains -- can be expressed under OpenAI's strict mode at
+/// all.
+///
+/// Every object-shaped (sub-)schema under strict mode must declare a
+/// concrete `properties` map of its own keys (`additionalProperties:
+/// false` is then enforced against exactly that set). A schema that
+/// instead accepts arbitrary, un-enumerated keys -- e.g. an MCP tool's
+/// free-form passthrough parameter, typically shaped as a bare `{"type":
+/// "object"}` with no `properties` at all -- can never be rewritten to
+/// satisfy that: forcing `additionalProperties: false` on it would reject
+/// every key the caller could ever send, defeating the entire purpose of
+/// a free-form object parameter. [`make_strict_schema_required`] must
+/// only ever be applied to a schema this function reports as compatible;
+/// see [`prepare_openai_tool_schema`] for the caller-facing decision this
+/// feeds into.
+fn schema_is_strict_compatible(schema: &Value) -> bool {
+    // JSON Schema's boolean shorthand: `true` accepts any value at all,
+    // including an arbitrary object with arbitrary keys -- exactly what
+    // `additionalProperties: false` cannot express. `false` accepts
+    // nothing, which is vacuously compatible (if odd) since no key could
+    // ever violate a constraint that never applies. `schemars` emits `true`
+    // for `serde_json::Value`-typed fields (a deliberately unconstrained
+    // "any JSON value" passthrough), which is exactly the free-form shape
+    // this whole check exists to catch.
+    let Value::Object(obj) = schema else {
+        return !matches!(schema, Value::Bool(true));
+    };
+
+    let is_object_shaped =
+        obj.get("type").is_some_and(type_mentions_object) || obj.contains_key("properties");
+
+    let properties_ok = match obj.get("properties") {
+        Some(Value::Object(properties)) => properties.values().all(schema_is_strict_compatible),
+        // `properties` present but not an object is malformed, not just
+        // "free-form" -- treat it the same as "no declared properties".
+        Some(_) => false,
+        // An object-shaped schema with no `properties` key at all accepts
+        // arbitrary keys -- exactly what `additionalProperties: false`
+        // cannot express. A non-object schema (string/array/etc.) with no
+        // `properties` key has nothing to enumerate in the first place, so
+        // this is trivially satisfied for it.
+        None => !is_object_shaped,
+    };
+
+    if !properties_ok {
+        return false;
+    }
+
+    match obj.get("items") {
+        Some(items) => schema_is_strict_compatible(items),
+        None => true,
+    }
+}
+
+fn type_mentions_object(type_value: &Value) -> bool {
+    match type_value {
+        Value::String(s) => s == "object",
+        Value::Array(arr) => arr.iter().any(|t| t.as_str() == Some("object")),
+        _ => false,
+    }
+}
+
+/// Prepares a tool's raw JSON schema for an OpenAI-shaped function
+/// definition and decides whether strict mode can be used for it at all.
+/// Shared by both `openai` (Responses API) and `openai_chat_completions`
+/// (and every provider built on it), which otherwise need the exact same
+/// pipeline:
+///
+/// 1. Force the top-level schema to `type: "object"` with a concrete
+///    (possibly empty) `properties` map -- both APIs require this of a
+///    tool's parameters schema regardless of strict mode.
+/// 2. Decide whether the schema can be expressed under strict mode at all
+///    (see [`schema_is_strict_compatible`]'s doc for why a free-form
+///    passthrough object schema can't be, at any nesting depth).
+/// 3. If compatible: recursively rewrite the schema to satisfy strict
+///    mode's requirements (see [`make_strict_schema_required`]) and report
+///    `true`.
+/// 4. If not: leave the schema as given beyond step 1's top-level
+///    defaulting (harmless either way) and report `false` -- the tool
+///    falls back to ordinary, non-strict tool calling, which has no
+///    `required`/`additionalProperties` constraints of its own and so
+///    tolerates a free-form object parameter just fine.
+///
+/// Returns the prepared schema and whether the caller should set
+/// `strict: true` on the resulting tool definition.
+pub(crate) fn prepare_openai_tool_schema(mut params: Value) -> (Value, bool) {
+    if let Value::Object(ref mut obj) = params {
+        obj.insert("type".to_string(), Value::String("object".to_string()));
+        if !obj.get("properties").is_some_and(Value::is_object) {
+            obj.insert(
+                "properties".to_string(),
+                Value::Object(serde_json::Map::new()),
+            );
+        }
+    }
+
+    if schema_is_strict_compatible(&params) {
+        make_strict_schema_required(&mut params);
+        (params, true)
+    } else {
+        (params, false)
+    }
+}
+
 /// Adds `"null"` to a property schema's `type`, so a field that wasn't
 /// already required can still be omitted (as `null`) under strict mode.
 /// Handles the three shapes `schemars` can emit for `type`: a bare string
@@ -268,5 +373,118 @@ mod tests {
             schema["properties"]["level"],
             json!({ "enum": ["low", "high"] })
         );
+    }
+
+    // ------------------------------------------------------------------
+    // schema_is_strict_compatible / prepare_openai_tool_schema
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn strict_compatible_for_a_fully_enumerated_schema() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "command": { "type": "string" }
+            },
+            "required": ["command"]
+        });
+        assert!(schema_is_strict_compatible(&schema));
+    }
+
+    /// Regression test reproducing the exact failure shape reported by a
+    /// real OpenAI-shaped provider against drift's MCP `execute_tool`
+    /// bridge: a free-form passthrough parameter shaped as a bare `{"type":
+    /// "object"}` with no `properties` of its own (so any key is valid --
+    /// exactly what `additionalProperties: false` cannot express).
+    #[test]
+    fn strict_incompatible_for_a_free_form_object_property_with_no_properties_key() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "server": { "type": "string" },
+                "tool": { "type": "string" },
+                "args": { "type": "object", "description": "Arguments to pass to the tool" }
+            },
+            "required": ["server", "tool"]
+        });
+        assert!(
+            !schema_is_strict_compatible(&schema),
+            "a free-form object property must make the whole schema strict-incompatible"
+        );
+    }
+
+    #[test]
+    fn strict_incompatible_when_the_free_form_object_is_nested_inside_an_array() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": { "type": "object" }
+                }
+            },
+            "required": ["items"]
+        });
+        assert!(!schema_is_strict_compatible(&schema));
+    }
+
+    #[test]
+    fn strict_compatible_for_an_object_with_an_explicitly_empty_properties_map() {
+        // An object schema that declares `properties: {}` is a concrete
+        // (empty) key set, not "accept anything" -- additionalProperties:
+        // false against it is meaningful (it just means "no properties at
+        // all"), unlike a bare `{"type": "object"}` with no properties key.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "flags": { "type": "object", "properties": {} }
+            },
+            "required": ["flags"]
+        });
+        assert!(schema_is_strict_compatible(&schema));
+    }
+
+    #[test]
+    fn prepare_tool_schema_rewrites_a_compatible_schema_and_reports_strict_true() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "command": { "type": "string" }
+            }
+        });
+        let (prepared, strict) = prepare_openai_tool_schema(schema);
+        assert!(strict);
+        assert_eq!(prepared["required"], json!(["command"]));
+        assert_eq!(prepared["additionalProperties"], json!(false));
+    }
+
+    #[test]
+    fn prepare_tool_schema_leaves_an_incompatible_schema_unrewritten_and_reports_strict_false() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "server": { "type": "string" },
+                "args": { "type": "object" }
+            },
+            "required": ["server"]
+        });
+        let (prepared, strict) = prepare_openai_tool_schema(schema);
+        assert!(
+            !strict,
+            "a free-form object parameter must fall back to strict: false"
+        );
+        // Left exactly as the caller's schema declared it -- not rewritten
+        // into a shape that would itself violate strict mode if it were
+        // ever accidentally sent with strict: true.
+        assert_eq!(prepared["required"], json!(["server"]));
+        assert_eq!(prepared["properties"]["args"], json!({ "type": "object" }));
+    }
+
+    #[test]
+    fn prepare_tool_schema_always_defaults_type_and_properties_regardless_of_strictness() {
+        let schema = json!({});
+        let (prepared, _strict) = prepare_openai_tool_schema(schema);
+        assert_eq!(prepared["type"], json!("object"));
+        assert_eq!(prepared["properties"], json!({}));
     }
 }
