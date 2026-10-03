@@ -39,7 +39,7 @@ impl From<LanguageModelOptions> for client::OpenAILanguageModelOptions {
         let items: Vec<types::InputItem> = options
             .messages
             .into_iter()
-            .filter_map(|m| m.message.into())
+            .flat_map(|m| message_to_input_items(m.message))
             .collect();
 
         let tools: Option<Vec<types::ToolParams>> = options.tools.map(|t| {
@@ -84,116 +84,173 @@ impl From<LanguageModelOptions> for client::OpenAILanguageModelOptions {
 
 impl From<Message> for Option<types::InputItem> {
     fn from(m: Message) -> Self {
-        match m {
-            Message::Tool(ref tool_info) => {
-                let text = tool_info
-                    .output
-                    .clone()
-                    .unwrap_or_else(|e| Value::String(e.to_string()))
-                    .to_string();
-                let image_items: Vec<types::ContentType> = tool_info
-                    .media
-                    .iter()
-                    .filter(|m| m.is_image())
-                    .map(|m| types::ContentType::InputImage {
-                        detail: types::ImageDetail::default(),
-                        file_id: None,
-                        image_url: Some(format!("data:{};base64,{}", m.mime_type, m.data)),
-                    })
-                    .collect();
-                let output = if image_items.is_empty() {
-                    types::FunctionCallOutput::Text(text)
-                } else {
-                    let mut items = vec![types::ContentType::InputText { text }];
-                    items.extend(image_items);
-                    types::FunctionCallOutput::List(items)
-                };
-                Some(types::InputItem::Item(
-                    types::MessageItem::FunctionCallOutput {
-                        id: None,
-                        type_: "function_call_output".to_string(),
-                        status: None,
-                        call_id: tool_info.tool.id.clone(),
-                        output,
-                    },
-                ))
-            }
-            Message::Assistant(ref assistant_msg) => match assistant_msg.content {
-                LanguageModelResponseContentType::Text(ref msg) => {
-                    Some(types::InputItem::Item(types::MessageItem::OutputMessage {
-                        id: None,
-                        type_: "message".to_string(),
-                        status: None,
-                        role: types::Role::Assistant,
-                        content: vec![types::OutputContent::OutputText {
-                            annotations: vec![],
-                            logprobs: vec![],
-                            text: msg.to_owned(),
-                        }],
-                    }))
-                }
-                LanguageModelResponseContentType::ToolCall(ref tool_info) => {
-                    Some(types::InputItem::Item(types::MessageItem::FunctionCall {
-                        id: None,
-                        status: None,
-                        arguments: tool_info.input.to_string(),
-                        call_id: tool_info.tool.id.clone(),
-                        name: tool_info.tool.name.clone(),
-                        type_: "function_call".to_string(),
-                    }))
-                }
-                LanguageModelResponseContentType::Reasoning { ref content, .. } => {
-                    Some(types::InputItem::Item(types::MessageItem::Reasoning {
-                        id: None,
-                        summary: vec![types::ReasoningSummary {
-                            type_: "summary_text".to_string(),
-                            text: content.clone(),
-                        }],
-                        type_: "reasoning".to_string(),
-                        content: None,
-                        encrypted_content: None,
-                        status: None,
-                    }))
-                }
-                _ => None,
-            },
-            Message::User(u) => {
-                // The Responses API's `input_image` block takes a single
-                // `image_url`, which for inline (non-hosted) images is a
-                // `data:<mime>;base64,<data>` URI rather than a separate
-                // base64 field -- unlike Anthropic's `source.data`/
-                // `source.media_type` split. Images are emitted before the
-                // text block, matching the ordering used for Anthropic.
-                let mut content: Vec<types::ContentType> = u
-                    .media
-                    .iter()
-                    .filter(|m| m.is_image())
-                    .map(|m| types::ContentType::InputImage {
-                        detail: types::ImageDetail::default(),
-                        file_id: None,
-                        image_url: Some(format!("data:{};base64,{}", m.mime_type, m.data)),
-                    })
-                    .collect();
-                content.push(types::ContentType::InputText { text: u.content });
-                Some(types::InputItem::Item(types::MessageItem::InputMessage {
-                    content,
-                    role: types::Role::User,
-                    type_: "message".to_string(),
-                }))
-            }
-            Message::System(s) => Some(types::InputItem::Item(types::MessageItem::InputMessage {
-                content: vec![types::ContentType::InputText { text: s.content }],
-                role: types::Role::System,
-                type_: "message".to_string(),
-            })),
-            Message::Developer(d) => {
-                Some(client::InputItem::Item(types::MessageItem::InputMessage {
-                    content: vec![types::ContentType::InputText { text: d }],
-                    role: types::Role::Developer,
-                    type_: "message".to_string(),
-                }))
-            }
+        message_to_input_items(m).into_iter().next()
+    }
+}
+
+fn function_call_item(tool_info: &crate::core::tools::ToolCallInfo) -> types::InputItem {
+    types::InputItem::Item(types::MessageItem::FunctionCall {
+        id: None,
+        status: None,
+        arguments: tool_info.input.to_string(),
+        call_id: tool_info.tool.id.clone(),
+        name: tool_info.tool.name.clone(),
+        type_: "function_call".to_string(),
+    })
+}
+
+fn reasoning_item(content: &str) -> types::InputItem {
+    types::InputItem::Item(types::MessageItem::Reasoning {
+        id: None,
+        summary: vec![types::ReasoningSummary {
+            type_: "summary_text".to_string(),
+            text: content.to_string(),
+        }],
+        type_: "reasoning".to_string(),
+        content: None,
+        encrypted_content: None,
+        status: None,
+    })
+}
+
+fn output_text_item(text: &str) -> types::InputItem {
+    types::InputItem::Item(types::MessageItem::OutputMessage {
+        id: None,
+        type_: "message".to_string(),
+        status: None,
+        role: types::Role::Assistant,
+        content: vec![types::OutputContent::OutputText {
+            annotations: vec![],
+            logprobs: vec![],
+            text: text.to_string(),
+        }],
+    })
+}
+
+/// Converts one SDK [`Message`] into the Responses API's flat `InputItem`
+/// list, expanding to more than one item when a single message logically
+/// carries more than one -- specifically
+/// [`LanguageModelResponseContentType::ReasonedResponse`], a complete
+/// thinking-model turn bundling reasoning, text, and (potentially several)
+/// tool calls into one SDK message.
+///
+/// The Responses API has no equivalent "one assistant turn, several tool
+/// calls" message shape the way Chat Completions' `ChatMessage.tool_calls`
+/// does: each tool call must be its own top-level `function_call` item in
+/// the flat `input` array. Before this, `ReasonedResponse` fell through a
+/// catch-all `_ => None` and the entire turn -- reasoning, text, AND every
+/// one of its tool calls -- was silently dropped from the request. The
+/// corresponding `function_call_output` item for a dropped tool call (from
+/// the paired `Message::Tool` result, which IS still converted) then had no
+/// matching `function_call` on a later request, which the Responses API
+/// rejects outright with HTTP 400: "No tool call found for function call
+/// output with call_id ...". This reproduced in practice whenever a
+/// thinking model made more than one tool call in a single turn -- the
+/// common case for e.g. a reasoning step that reads a file and checks a
+/// process in parallel -- against the `openai` provider specifically (the
+/// `openai_chat_completions` provider already converts `ReasonedResponse`
+/// correctly, since `ChatMessage.tool_calls` is already a list).
+///
+/// Order: reasoning item first (matching the Responses API's model-facing
+/// "thought then acted" shape), then one `function_call` item per tool
+/// call in original order, then a trailing output-text item if `text` is
+/// non-empty (most `ReasonedResponse` turns that make tool calls have no
+/// accompanying text, but a few provider shapes do pair both).
+fn message_to_input_items(m: Message) -> Vec<types::InputItem> {
+    match m {
+        Message::Tool(ref tool_info) => {
+            let text = tool_info
+                .output
+                .clone()
+                .unwrap_or_else(|e| Value::String(e.to_string()))
+                .to_string();
+            let image_items: Vec<types::ContentType> = tool_info
+                .media
+                .iter()
+                .filter(|m| m.is_image())
+                .map(|m| types::ContentType::InputImage {
+                    detail: types::ImageDetail::default(),
+                    file_id: None,
+                    image_url: Some(format!("data:{};base64,{}", m.mime_type, m.data)),
+                })
+                .collect();
+            let output = if image_items.is_empty() {
+                types::FunctionCallOutput::Text(text)
+            } else {
+                let mut items = vec![types::ContentType::InputText { text }];
+                items.extend(image_items);
+                types::FunctionCallOutput::List(items)
+            };
+            vec![types::InputItem::Item(
+                types::MessageItem::FunctionCallOutput {
+                    id: None,
+                    type_: "function_call_output".to_string(),
+                    status: None,
+                    call_id: tool_info.tool.id.clone(),
+                    output,
+                },
+            )]
         }
+        Message::Assistant(assistant_msg) => match assistant_msg.content {
+            LanguageModelResponseContentType::Text(ref msg) => vec![output_text_item(msg)],
+            LanguageModelResponseContentType::ToolCall(ref tool_info) => {
+                vec![function_call_item(tool_info)]
+            }
+            LanguageModelResponseContentType::Reasoning { ref content, .. } => {
+                vec![reasoning_item(content)]
+            }
+            LanguageModelResponseContentType::ReasonedResponse {
+                reasoning,
+                text,
+                tool_calls,
+                ..
+            } => {
+                let mut items = Vec::with_capacity(2 + tool_calls.len());
+                if !reasoning.is_empty() {
+                    items.push(reasoning_item(&reasoning));
+                }
+                items.extend(tool_calls.iter().map(function_call_item));
+                if !text.is_empty() {
+                    items.push(output_text_item(&text));
+                }
+                items
+            }
+            _ => vec![],
+        },
+        Message::User(u) => {
+            // The Responses API's `input_image` block takes a single
+            // `image_url`, which for inline (non-hosted) images is a
+            // `data:<mime>;base64,<data>` URI rather than a separate
+            // base64 field -- unlike Anthropic's `source.data`/
+            // `source.media_type` split. Images are emitted before the
+            // text block, matching the ordering used for Anthropic.
+            let mut content: Vec<types::ContentType> = u
+                .media
+                .iter()
+                .filter(|m| m.is_image())
+                .map(|m| types::ContentType::InputImage {
+                    detail: types::ImageDetail::default(),
+                    file_id: None,
+                    image_url: Some(format!("data:{};base64,{}", m.mime_type, m.data)),
+                })
+                .collect();
+            content.push(types::ContentType::InputText { text: u.content });
+            vec![types::InputItem::Item(types::MessageItem::InputMessage {
+                content,
+                role: types::Role::User,
+                type_: "message".to_string(),
+            })]
+        }
+        Message::System(s) => vec![types::InputItem::Item(types::MessageItem::InputMessage {
+            content: vec![types::ContentType::InputText { text: s.content }],
+            role: types::Role::System,
+            type_: "message".to_string(),
+        })],
+        Message::Developer(d) => vec![client::InputItem::Item(types::MessageItem::InputMessage {
+            content: vec![types::ContentType::InputText { text: d }],
+            role: types::Role::Developer,
+            type_: "message".to_string(),
+        })],
     }
 }
 
@@ -259,7 +316,8 @@ mod tests {
     use super::client::*;
     use crate::core::Message;
     use crate::core::language_model::{
-        LanguageModelOptions, ReasoningEffort as LMReasoningEffort, Usage,
+        LanguageModelOptions, LanguageModelResponseContentType,
+        ReasoningEffort as LMReasoningEffort, Usage,
     };
     use crate::core::tools::{Tool, ToolExecute, ToolList};
     use schemars::{JsonSchema, schema_for};
@@ -408,6 +466,72 @@ mod tests {
                 other => panic!("expected FunctionCallOutput::List, got: {other:?}"),
             },
             _ => panic!("expected FunctionCallOutput item"),
+        }
+    }
+
+    /// Regression test reproducing a real end-to-end failure: a thinking
+    /// model's single turn with MULTIPLE tool calls (`ReasonedResponse`)
+    /// used to fall through a catch-all `_ => None` in the `openai`
+    /// provider's message conversion, silently dropping the entire turn --
+    /// reasoning, text, AND every tool call -- from the request. The
+    /// following `Message::Tool` result for one of those dropped calls (IS
+    /// still converted on its own) then has no matching `function_call`
+    /// item in the request, which the Responses API rejects outright with
+    /// HTTP 400: "No tool call found for function call output with
+    /// call_id ...".
+    #[test]
+    fn test_reasoned_response_with_multiple_tool_calls_emits_one_function_call_item_each() {
+        use crate::core::tools::ToolCallInfo;
+
+        let mut tc1 = ToolCallInfo::new("file_read");
+        tc1.id("call-1".to_string());
+        tc1.input(json!({"path": "a.rs"}));
+        let mut tc2 = ToolCallInfo::new("shell_exec");
+        tc2.id("call-2".to_string());
+        tc2.input(json!({"command": "ps aux"}));
+
+        let turn = Message::Assistant(crate::core::messages::AssistantMessage {
+            content: LanguageModelResponseContentType::ReasonedResponse {
+                reasoning: "Let me check both at once".to_string(),
+                text: String::new(),
+                tool_calls: vec![tc1, tc2],
+                extensions: crate::extensions::Extensions::default(),
+            },
+            usage: None,
+        });
+
+        let options = LanguageModelOptions {
+            messages: vec![turn.into()],
+            ..Default::default()
+        };
+        let req: OpenAILanguageModelOptions = options.into();
+        let Input::InputItemList(items) = req.input.expect("input should be present") else {
+            panic!("expected input item list")
+        };
+
+        // reasoning item, then one function_call item per tool call, in order.
+        assert_eq!(
+            items.len(),
+            3,
+            "expected reasoning + 2 function_call items, got: {items:?}"
+        );
+        assert!(matches!(
+            &items[0],
+            InputItem::Item(MessageItem::Reasoning { .. })
+        ));
+        match &items[1] {
+            InputItem::Item(MessageItem::FunctionCall { name, call_id, .. }) => {
+                assert_eq!(name, "file_read");
+                assert_eq!(call_id, "call-1");
+            }
+            other => panic!("expected FunctionCall for call-1, got: {other:?}"),
+        }
+        match &items[2] {
+            InputItem::Item(MessageItem::FunctionCall { name, call_id, .. }) => {
+                assert_eq!(name, "shell_exec");
+                assert_eq!(call_id, "call-2");
+            }
+            other => panic!("expected FunctionCall for call-2, got: {other:?}"),
         }
     }
 
